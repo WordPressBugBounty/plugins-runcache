@@ -1,0 +1,54 @@
+{
+  "resources/js/main.js": {
+    "file": "js/main.js",
+    "name": "main",
+    "src": "resources/js/main.js",
+    "isEntry": true,
+    "dynamicImports": [
+      "resources/js/pages/Dashboard.vue",
+      "resources/js/pages/Purger.vue",
+      "resources/js/pages/Preloader.vue",
+      "resources/js/pages/Rules.vue"
+    ]
+  },
+  "resources/js/pages/Dashboard.vue": {
+    "file": "js/dashboard-Bin1AgSm.js",
+    "name": "dashboard",
+    "src": "resources/js/pages/Dashboard.vue",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/main.js"
+    ]
+  },
+  "resources/js/pages/Preloader.vue": {
+    "file": "js/preloader-CQbaGm72.js",
+    "name": "preloader",
+    "src": "resources/js/pages/Preloader.vue",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/main.js"
+    ]
+  },
+  "resources/js/pages/Purger.vue": {
+    "file": "js/purger-D6s5_aTE.js",
+    "name": "purger",
+    "src": "resources/js/pages/Purger.vue",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/main.js"
+    ]
+  },
+  "resources/js/pages/Rules.vue": {
+    "file": "js/rules-DQ8J1VXn.js",
+    "name": "rules",
+    "src": "resources/js/pages/Rules.vue",
+    "isDynamicEntry": true,
+    "imports": [
+      "resources/js/main.js"
+    ]
+  },
+  "style.css": {
+    "file": "css/main.css",
+    "src": "style.css"
+  }
+}
