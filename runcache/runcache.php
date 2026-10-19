@@ -3,7 +3,7 @@
  * Plugin Name: RunCache – Full-Page, Object, and Edge Caching
  * Plugin URI: https://runcloud.io/runcache
  * Description: Supercharge your WordPress site with lightning-fast page loads. RunCache delivers instant page speeds through intelligent caching, automatic content updates, and simple one-click optimization.
- * Version: 1.2.0
+ * Version: 1.1.0
  * Author: RunCloud
  * Author URI: https://runcloud.io
  * License: GPL v2 or later
@@ -21,7 +21,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Define plugin constants
-define('RUNCACHE_VERSION', '1.2.0');
+define('RUNCACHE_VERSION', '1.1.0');
 define('RUNCACHE_PLUGIN_NAME', 'RunCache');
 define('RUNCACHE_PLUGIN_FILE', __FILE__);
 define('RUNCACHE_PLUGIN_DIR', plugin_dir_path(__FILE__));
