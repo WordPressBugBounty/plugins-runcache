@@ -6,6 +6,7 @@ use Exception;
 use RunCache\Core\PageCache;
 use RunCache\Core\Setting;
 use RunCache\Integrations\Interfaces\CacheProvider;
+use RunCache\Support\Environment;
 use RunCache\Support\File;
 use RunCache\Support\Logger;
 use RunCache\Support\Validator;
@@ -53,6 +54,7 @@ class FastCGI implements CacheProvider
             add_action('runcache_after_purge_all', [$this, 'purge_all_cache']);
             add_action('runcache_after_purge_post', [$this, 'purge_post_cache'], 10, 2);
             add_action('runcache_after_purge_url', [$this, 'purge_url_cache']);
+            add_action('runcache_after_purge_network', [$this, 'purge_network_cache']);
         }
     }
 
@@ -218,7 +220,7 @@ class FastCGI implements CacheProvider
 
             if ($type === 'd') {
                 $count += $this->count_files_recursive($directory . '/' . $filename, $file, $total_size);
-            } elseif ($type === 'f' && $filename !== 'index.html') {
+            } elseif ('f' === $type && $filename !== 'index.php' && 'index.html' !== $filename) {
                 $count++;
                 $total_size += $file->size($directory . '/' . $filename);
             }
@@ -249,7 +251,9 @@ class FastCGI implements CacheProvider
 
         $site_name = $this->get_site_name();
         $cache_zone = 'runcache_' . $site_name . '_fastcgi';
-        $site_host = isset($_SERVER['HTTP_HOST']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_HOST'])) : wp_parse_url(get_site_url(), PHP_URL_HOST);
+        // Generation and invalidation must never diverge, so both use
+        // the same host source.
+        $site_host = Setting::get_site_host();
 
         foreach ($configs as $config) {
             $config_source = RUNCACHE_PLUGIN_DIR . 'includes/' . $config;
@@ -266,14 +270,16 @@ class FastCGI implements CacheProvider
                 return false;
             }
 
-            $replacements = [
+            // The profile escapes layout tokens, so only the extras get escaping here.
+            $environment = Environment::instance();
+            $host_escaped = (string) preg_replace('/[^A-Za-z0-9._-]/', '', (string) $site_host);
+            $config_content = $environment->substitute($config_content, [
                 '{{CACHE_ZONE}}' => $cache_zone,
                 '{{SITE_CACHE_VAR}}' => $site_name,
-                '{{HOST}}' => $site_host,
-                '{{DOCUMENT_ROOT}}' => ABSPATH,
-            ];
-
-            $config_content = str_replace(array_keys($replacements), array_values($replacements), $config_content);
+                '{{HOST}}' => '' !== $host_escaped ? $host_escaped : 'localhost',
+                '{{SITE_WOO_MAP}}' => Multisite::fastcgi_woo_map_lines(),
+                '{{MARKER_SITE_IFS}}' => Multisite::nginx_marker_site_ifs(),
+            ]);
 
             $write_success = $file->write($config_target, $config_content);
             if (!$write_success) {
@@ -374,8 +380,8 @@ class FastCGI implements CacheProvider
                 return false;
             }
 
-            $index_content = '<!-- Silence is golden - RunCache FastCGI protected directory -->';
-            $file->write($fastcgi_dir . 'index.html', $index_content);
+            // The file may be served directly, so an empty body discloses nothing.
+            $file->write($fastcgi_dir . 'index.html', '');
         }
 
         return true;
@@ -390,15 +396,40 @@ class FastCGI implements CacheProvider
     {
         $file = new File();
 
-        $this->logger->info('Purging all cache for site', ['provider' => 'FastCGI']);
-
         $cache_dir = RUNCACHE_CACHE_DIRECTORY;
         $site_host = Setting::get_site_host();
         $fastcgi_dir = $cache_dir . $site_host . '/fastcgi/';
 
+        // FastCGI entries are MD5-hashed under the host directory, so on a
+        // subdirectory network the purge stays host-shared and says so.
+        $shared_host = Multisite::is_multisite() && !is_subdomain_install();
+        $this->logger->info('Purging FastCGI cache', [
+            'provider' => 'FastCGI',
+            'scope' => $shared_host ? 'host (shared by the network sites)' : 'site',
+            'directory' => $fastcgi_dir,
+        ]);
+
         if ($file->exists($fastcgi_dir)) {
             $file->delete($fastcgi_dir, true);
         }
+
+        $this->ensure_fastcgi_cache_directory();
+    }
+
+    /**
+     * Purge FastCGI cache for the whole network
+     *
+     * The network purge clears the whole cache root, so this only records
+     * the scope and recreates the site's directory.
+     *
+     * @return void
+     */
+    public function purge_network_cache(): void
+    {
+        $this->logger->info('Network purge includes the FastCGI cache', [
+            'provider' => 'FastCGI',
+            'scope' => 'network',
+        ]);
 
         $this->ensure_fastcgi_cache_directory();
     }

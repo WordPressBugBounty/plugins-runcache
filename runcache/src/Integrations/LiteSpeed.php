@@ -6,6 +6,7 @@ use RunCache\Core\PageCache;
 use RunCache\Core\Rules;
 use RunCache\Core\Setting;
 use RunCache\Integrations\Interfaces\CacheProvider;
+use RunCache\Support\Environment;
 use RunCache\Support\File;
 use RunCache\Support\Logger;
 use RunCache\Support\Server;
@@ -417,11 +418,14 @@ class LiteSpeed implements CacheProvider
     /**
      * Get the path to the site's .htaccess file.
      *
+     * On Bedrock the web server reads the docroot .htaccess, not the
+     * core directory one, so the profile decides.
+     *
      * @return string
      */
     private function get_htaccess_path(): string
     {
-        return ABSPATH . '.htaccess';
+        return Environment::instance()->get_htaccess_path();
     }
 
     /**

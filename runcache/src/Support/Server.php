@@ -432,8 +432,8 @@ class Server
 
             wp_send_json_success([
                 'server_type' => $server_type,
-                'document_root' => untrailingslashit(ABSPATH),
-                'config_dir' => $config_dir !== false ? untrailingslashit($config_dir) : untrailingslashit(ABSPATH),
+                'document_root' => Environment::instance()->get_document_root(),
+                'config_dir' => $config_dir !== false ? untrailingslashit($config_dir) : Environment::instance()->get_document_root(),
                 'site_url' => home_url(),
                 'site_name' => get_bloginfo('name'),
                 'admin_url' => admin_url()

@@ -96,6 +96,23 @@ if (!function_exists('runcache_should_cache')) {
                 // Treat % as a wildcard. fnmatch needs *.
                 $normalized = str_replace('%', '*', $pattern);
 
+                $is_anchored = $normalized !== ''
+                    && ($normalized[0] === '^' || substr($normalized, -1) === '$')
+                    && trim($normalized, '^$') !== '';
+
+                if ($is_anchored) {
+                    // Anchored patterns are regex; fnmatch reads them as literals.
+                    // A broken pattern falls through and matches nothing.
+                    if (strlen($normalized) <= 512) {
+                        $regex = '#' . str_replace('#', '\#', $normalized) . '#i';
+                        if (@preg_match($regex, $subject) === 1) {
+                            return true;
+                        }
+                    }
+
+                    continue;
+                }
+
                 // Try a case-insensitive wildcard match.
                 $fnmatch_result = fnmatch($normalized, $subject, FNM_CASEFOLD);
 

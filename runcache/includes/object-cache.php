@@ -21,6 +21,16 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+/*
+ * Drop-in layout version.
+ *
+ * v3 bakes the site prefix into redis.key_prefix, so the installer must
+ * reinstall this drop-in per site and purge the legacy unscoped keys.
+ */
+if (!defined('RUNCACHE_OBJECT_CACHE_VERSION')) {
+    define('RUNCACHE_OBJECT_CACHE_VERSION', '3');
+}
+
 global $runcache_redis_connection, $runcache_redis_connection_attempted;
 $runcache_redis_connection = $runcache_redis_connection ?? null;
 $runcache_redis_connection_attempted = false;
@@ -82,15 +92,248 @@ if (!isset($runcache_ignored_groups)) {
 }
 
 /**
+ * Normalizes one config key component (host or path segment).
+ *
+ * Must stay in sync with runcache_normalize_config_component() in
+ * includes/runcache-config.php.
+ *
+ * @param string $value Raw component value.
+ * @return string Normalized component, possibly empty.
+ */
+function runcache_object_cache_normalize_component(string $value): string
+{
+    $value = strtolower(trim($value));
+    $value = preg_replace('/[^a-z0-9._-]+/', '-', $value) ?? '';
+    $value = preg_replace('/-+/', '-', $value) ?? '';
+
+    return trim($value, '-');
+}
+
+/**
+ * Normalizes a host for the config key: port and trailing dots removed.
+ *
+ * Must stay in sync with runcache_normalize_config_host() in
+ * includes/runcache-config.php.
+ *
+ * @param string $host Raw host value.
+ * @return string Normalized host, possibly empty.
+ */
+function runcache_object_cache_normalize_host(string $host): string
+{
+    $host = strtolower(trim($host));
+    $host = preg_replace('/:\d+$/', '', $host) ?? '';
+    $host = rtrim($host, '.');
+
+    return runcache_object_cache_normalize_component($host);
+}
+
+/**
+ * Resolves the config map keys to try for the current site, longest first.
+ *
+ * This drop-in is copied verbatim and runs before WordPress, so the
+ * small resolution logic mirrors runcache_get_config_candidates() by hand.
+ * The first candidate present in the sites map wins, so a main-site
+ * subpage falls back to the host row and a nested site matches its full
+ * path before its parent's row.
+ *
+ * @return array<int, string> Candidate keys, longest path first.
+ */
+function runcache_object_cache_config_candidates(): array
+{
+    // The drop-in runs before WordPress, so the legacy input handling mirrors runcache_get_server_var().
+    $raw_host = isset($_SERVER['HTTP_HOST']) && is_string($_SERVER['HTTP_HOST'])
+        ? trim(stripslashes($_SERVER['HTTP_HOST']))
+        : '';
+    $host = runcache_object_cache_normalize_host($raw_host);
+
+    if ('' === $host) {
+        return [];
+    }
+
+    if (!(defined('MULTISITE') && MULTISITE && (!defined('SUBDOMAIN_INSTALL') || !SUBDOMAIN_INSTALL))) {
+        return [$host];
+    }
+
+    $raw_uri = isset($_SERVER['REQUEST_URI']) && is_string($_SERVER['REQUEST_URI'])
+        ? trim(stripslashes($_SERVER['REQUEST_URI']))
+        : '/';
+    $path = parse_url('' !== $raw_uri ? $raw_uri : '/', PHP_URL_PATH);
+    $path = trim(is_string($path) ? $path : '', '/');
+
+    $candidates = [];
+    $prefix = '';
+    foreach (explode('/', $path) as $segment) {
+        $segment = runcache_object_cache_normalize_component($segment);
+        if ('' === $segment) {
+            continue;
+        }
+
+        $prefix = '' === $prefix ? $segment : $prefix . '/' . $segment;
+        $candidates[] = $host . '/' . $prefix;
+    }
+
+    $candidates = array_reverse($candidates);
+    $candidates[] = $host;
+
+    return $candidates;
+}
+
+/**
+ * Loads this site's entry from the generated shared config file.
+ *
+ * A broken file must not abort the request, so a missing or broken
+ * file returns an empty array and callers fall back to constants.
+ *
+ * @return array<string, mixed> This site's config entry, or [] when unavailable.
+ */
+function runcache_object_cache_site_config(): array
+{
+    static $site_config = null;
+    if ($site_config !== null) {
+        return $site_config;
+    }
+
+    $site_config = [];
+
+    if (!defined('RUNCACHE_CONFIG_FILE')) {
+        if (!defined('WP_CONTENT_DIR')) {
+            return $site_config;
+        }
+        define('RUNCACHE_CONFIG_FILE', WP_CONTENT_DIR . '/runcache-config.php');
+    }
+
+    if (!is_readable(RUNCACHE_CONFIG_FILE)) {
+        return $site_config;
+    }
+
+    $loaded = null;
+    $ob_level = ob_get_level();
+    ob_start();
+    try {
+        // A broken file must not abort the request, so the include is guarded.
+        $loaded = @include RUNCACHE_CONFIG_FILE;
+    } catch (\Throwable $exception) {
+        $loaded = null; // ParseError is catchable (PHP 7+).
+    } finally {
+        // A corrupted file can emit stray output on include, and only
+        // our own buffer may be closed, never an outer one.
+        if (ob_get_level() > $ob_level) {
+            ob_end_clean();
+        }
+    }
+
+    if (!is_array($loaded)) {
+        return $site_config;
+    }
+
+    $candidates = runcache_object_cache_config_candidates();
+    foreach ($candidates as $candidate) {
+        $site = $loaded['sites'][$candidate] ?? null;
+        if (is_array($site)) {
+            $site_config = $site;
+            break;
+        }
+    }
+
+    return $site_config;
+}
+
+/**
+ * Reports whether this site uses the persistent Redis cache.
+ *
+ * A row without the flag predates the per-site switch and keeps the
+ * enabled behavior, so an upgrade never silently stops caching. Must
+ * stay in sync with RedisObjectCache::network_still_uses_object_cache().
+ *
+ * @return bool True when reads and writes may use Redis.
+ */
+function runcache_object_cache_persistent_enabled(): bool
+{
+    static $enabled = null;
+    if ($enabled !== null) {
+        return $enabled;
+    }
+
+    $site_config = runcache_object_cache_site_config();
+    $enabled = filter_var($site_config['object_cache_enabled'] ?? true, FILTER_VALIDATE_BOOLEAN);
+
+    return $enabled;
+}
+
+/**
+ * Resolves Redis connection settings for the object cache.
+ *
+ * Hand-written RUNCACHE_REDIS_* constants are the documented override
+ * input, so they win over the channel and the built-in defaults.
+ *
+ * @return array<string, mixed> host, port, key, username, password, database.
+ */
+function runcache_object_cache_redis_settings(): array
+{
+    static $settings = null;
+    if ($settings !== null) {
+        return $settings;
+    }
+
+    $settings = [
+        'host' => '127.0.0.1',
+        'port' => 6379,
+        'key' => 'runcache:',
+        'key_prefix' => '',
+        'username' => '',
+        'password' => '',
+        'database' => null,
+    ];
+
+    $config = [];
+    $site_config = runcache_object_cache_site_config();
+    if (isset($site_config['redis']) && is_array($site_config['redis'])) {
+        $config = $site_config['redis'];
+    }
+
+    $settings['host'] = defined('RUNCACHE_REDIS_HOST') && '' !== RUNCACHE_REDIS_HOST
+        ? (string) RUNCACHE_REDIS_HOST
+        : (string) ($config['host'] ?? $settings['host']);
+    $settings['port'] = defined('RUNCACHE_REDIS_PORT')
+        ? (int) RUNCACHE_REDIS_PORT
+        : (int) ($config['port'] ?? $settings['port']);
+    $settings['key'] = defined('RUNCACHE_REDIS_KEY')
+        ? (string) RUNCACHE_REDIS_KEY
+        : (string) ($config['key'] ?? $settings['key']);
+    // RUNCACHE_REDIS_KEY overrides the whole key family, so the operator
+    // keeps ownership of the key separation.
+    $settings['key_prefix'] = defined('RUNCACHE_REDIS_KEY')
+        ? ''
+        : (string) ($config['key_prefix'] ?? '');
+    $settings['username'] = defined('RUNCACHE_REDIS_USERNAME')
+        ? (string) RUNCACHE_REDIS_USERNAME
+        : (string) ($config['username'] ?? $settings['username']);
+    $settings['password'] = defined('RUNCACHE_REDIS_PASSWORD')
+        ? (string) RUNCACHE_REDIS_PASSWORD
+        : (string) ($config['password'] ?? $settings['password']);
+    $settings['database'] = defined('RUNCACHE_REDIS_DATABASE')
+        ? (int) RUNCACHE_REDIS_DATABASE
+        : (isset($config['database']) ? (int) $config['database'] : null);
+    return $settings;
+}
+
+/**
  * Gets the Redis key prefix for object cache entries.
+ *
+ * The channel bakes the site identity into key_prefix, so the drop-in
+ * uses it verbatim and the operator owns the key separation.
  *
  * @return string The key prefix.
  */
 function runcache_object_cache_get_prefix(): string
 {
-    $base_prefix = defined('RUNCACHE_REDIS_KEY') ? (string) RUNCACHE_REDIS_KEY : 'runcache:';
-    $base_prefix = rtrim($base_prefix, ':') . ":";
-    return $base_prefix . 'object:';
+    $settings = runcache_object_cache_redis_settings();
+
+    if ('' !== $settings['key_prefix']) {
+        return rtrim($settings['key_prefix'], ':') . ':object:';
+    }
+
+    return rtrim($settings['key'], ':') . ':object:';
 }
 
 /**
@@ -189,10 +432,9 @@ function runcache_object_cache_connect(): ?\Redis
         return null;
     }
 
-    $host = defined('RUNCACHE_REDIS_HOST') && RUNCACHE_REDIS_HOST !== ''
-        ? (string) RUNCACHE_REDIS_HOST
-        : '127.0.0.1';
-    $port = defined('RUNCACHE_REDIS_PORT') ? (int) RUNCACHE_REDIS_PORT : 6379;
+    $settings = runcache_object_cache_redis_settings();
+    $host = $settings['host'];
+    $port = $settings['port'];
 
     try {
         $redis = new \Redis();
@@ -204,8 +446,8 @@ function runcache_object_cache_connect(): ?\Redis
         if (function_exists('runcache_authenticate_redis')) {
             runcache_authenticate_redis($redis);
         } else {
-            $password = defined('RUNCACHE_REDIS_PASSWORD') ? trim((string) RUNCACHE_REDIS_PASSWORD) : '';
-            $username = defined('RUNCACHE_REDIS_USERNAME') ? trim((string) RUNCACHE_REDIS_USERNAME) : '';
+            $password = trim((string) $settings['password']);
+            $username = trim((string) $settings['username']);
 
             if ($password !== '') {
                 if ($username !== '') {
@@ -218,8 +460,8 @@ function runcache_object_cache_connect(): ?\Redis
             }
         }
 
-        if (defined('RUNCACHE_REDIS_DATABASE')) {
-            if (!$redis->select((int) RUNCACHE_REDIS_DATABASE)) {
+        if (null !== $settings['database']) {
+            if (!$redis->select((int) $settings['database'])) {
                 throw new \RuntimeException('Failed to select Redis database');
             }
         }
@@ -239,9 +481,15 @@ function runcache_object_cache_connect(): ?\Redis
  *
  * @return \Redis|null Redis connection object or null if unavailable.
  */
-function runcache_object_cache_get_connection(): ?\Redis
+function runcache_object_cache_get_connection(bool $for_invalidation = false): ?\Redis
 {
     global $runcache_redis_connection, $runcache_redis_connection_attempted;
+
+    // A site with the flag off skips Redis reads and writes. Invalidation
+    // calls pass true so stale shared keys still get removed.
+    if (!$for_invalidation && !runcache_object_cache_persistent_enabled()) {
+        return null;
+    }
 
     if ($runcache_redis_connection_attempted) {
         return $runcache_redis_connection;
@@ -607,7 +855,7 @@ function wp_cache_delete($key, $group = 'default')
         return $redis_exists;
     }
 
-    $redis = runcache_object_cache_get_connection();
+    $redis = runcache_object_cache_get_connection(true);
     
     if (!$redis) {
         return $redis_exists;
@@ -623,33 +871,61 @@ function wp_cache_delete($key, $group = 'default')
     }
 }
 
-function wp_cache_flush()
+/**
+ * Deletes every Redis key matching one glob pattern, in bounded batches.
+ *
+ * SCAN keeps the load bounded; the caller owns the scope of the pattern.
+ *
+ * @param \Redis $redis   Redis connection.
+ * @param string $pattern Glob pattern, e.g. a site's key namespace.
+ * @return int Number of deleted keys.
+ */
+function runcache_object_cache_delete_by_pattern($redis, string $pattern): int
 {
     global $runcache_memory_cache;
 
-    $redis = runcache_object_cache_get_connection();
-    
+    $deleted = 0;
+    $iterator = null;
+    $scan_count = 500;
+
+    do {
+        $result = $redis->scan($iterator, $pattern, $scan_count);
+        $keys = runcache_normalize_scan_result($iterator, $result);
+
+        if (empty($keys)) {
+            continue;
+        }
+
+        foreach ($keys as $key) {
+            unset($runcache_memory_cache[$key]);
+        }
+        runcache_delete_redis_batch($redis, $keys);
+        $deleted += count($keys);
+    } while ($iterator !== 0);
+
+    return $deleted;
+}
+
+function wp_cache_flush()
+{
+    global $runcache_memory_cache, $runcache_blog_prefix;
+
+    $redis = runcache_object_cache_get_connection(true);
+
     if (!$redis) {
         return false;
     }
 
     try {
-        // Process bounded batches to avoid retaining the full key set in PHP.
-        $iterator = null;
-        $pattern = runcache_object_cache_get_prefix() . '*';
-        $scan_count = 500;
-        
-        do {
-            $result = $redis->scan($iterator, $pattern, $scan_count);
-            $keys = runcache_normalize_scan_result($iterator, $result);
+        // WordPress core semantics: a flush clears the current site only.
+        // Global groups are network-shared and survive a site flush.
+        runcache_initialize_prefixes();
 
-            if (!empty($keys)) {
-                foreach ($keys as $key) {
-                    unset($runcache_memory_cache[$key]);
-                }
-                runcache_delete_redis_batch($redis, $keys);
-            }
-        } while ($iterator !== 0);
+        // build_key() trims the prefix segment, so the pattern trims too.
+        $site_segment = trim((string) $runcache_blog_prefix, '_-:$');
+        $base_prefix = runcache_object_cache_get_prefix();
+        $pattern = $site_segment === '' ? $base_prefix . '*' : $base_prefix . $site_segment . ':*';
+        runcache_object_cache_delete_by_pattern($redis, $pattern);
 
         $runcache_memory_cache = [];
 
@@ -657,6 +933,38 @@ function wp_cache_flush()
     } catch (\Throwable $exception) {
         if (defined('WP_DEBUG') && WP_DEBUG) {
             error_log('[RunCache] Redis flush error: ' . runcache_redact_log_message($exception->getMessage()));
+        }
+        return false;
+    }
+}
+
+/**
+ * Clears every object-cache key of the whole network.
+ *
+ * The network purge uses this; a per-site flush keeps global groups and
+ * sibling blogs.
+ *
+ * @return bool True on success
+ */
+function wp_cache_flush_network(): bool
+{
+    global $runcache_memory_cache;
+
+    $redis = runcache_object_cache_get_connection(true);
+
+    if (!$redis) {
+        return false;
+    }
+
+    try {
+        runcache_object_cache_delete_by_pattern($redis, runcache_object_cache_get_prefix() . '*');
+
+        $runcache_memory_cache = [];
+
+        return true;
+    } catch (\Throwable $exception) {
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('[RunCache] Redis network flush error: ' . runcache_redact_log_message($exception->getMessage()));
         }
         return false;
     }
@@ -689,7 +997,7 @@ function wp_cache_flush_group($group): bool
 {
     global $runcache_memory_cache;
 
-    $redis = runcache_object_cache_get_connection();
+    $redis = runcache_object_cache_get_connection(true);
 
     if (!$redis) {
         return false;
@@ -702,20 +1010,7 @@ function wp_cache_flush_group($group): bool
         $pattern = $base_prefix . '*:' . $sanitized_group . ':*';
 
         // Process bounded batches to avoid retaining the full key set in PHP.
-        $iterator = null;
-        $scan_count = 500;
-        do {
-            $result = $redis->scan($iterator, $pattern, $scan_count);
-            $keys = runcache_normalize_scan_result($iterator, $result);
-
-            if (!empty($keys)) {
-                // Remove from memory cache and Redis immediately.
-                foreach ($keys as $key) {
-                    unset($runcache_memory_cache[$key]);
-                }
-                runcache_delete_redis_batch($redis, $keys);
-            }
-        } while ($iterator !== 0);
+        runcache_object_cache_delete_by_pattern($redis, $pattern);
 
         return true;
     } catch (\Throwable $exception) {
@@ -1062,7 +1357,7 @@ function wp_cache_delete_multiple(array $keys, $group = 'default'): array
         return $results;
     }
 
-    $redis = runcache_object_cache_get_connection();
+    $redis = runcache_object_cache_get_connection(true);
     if (!$redis) {
         return $results;
     }

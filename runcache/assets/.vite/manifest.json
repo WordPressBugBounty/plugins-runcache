@@ -12,7 +12,7 @@
     ]
   },
   "resources/js/pages/Dashboard.vue": {
-    "file": "js/dashboard-Bin1AgSm.js",
+    "file": "js/dashboard-CSKixN-3.js",
     "name": "dashboard",
     "src": "resources/js/pages/Dashboard.vue",
     "isDynamicEntry": true,
@@ -21,7 +21,7 @@
     ]
   },
   "resources/js/pages/Preloader.vue": {
-    "file": "js/preloader-CQbaGm72.js",
+    "file": "js/preloader-RW9W_jmX.js",
     "name": "preloader",
     "src": "resources/js/pages/Preloader.vue",
     "isDynamicEntry": true,
@@ -30,7 +30,7 @@
     ]
   },
   "resources/js/pages/Purger.vue": {
-    "file": "js/purger-D6s5_aTE.js",
+    "file": "js/purger-BgmVVk1V.js",
     "name": "purger",
     "src": "resources/js/pages/Purger.vue",
     "isDynamicEntry": true,
@@ -39,7 +39,7 @@
     ]
   },
   "resources/js/pages/Rules.vue": {
-    "file": "js/rules-DQ8J1VXn.js",
+    "file": "js/rules-BgsgArMD.js",
     "name": "rules",
     "src": "resources/js/pages/Rules.vue",
     "isDynamicEntry": true,

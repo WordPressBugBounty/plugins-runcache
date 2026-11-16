@@ -4,6 +4,7 @@ namespace RunCache\Support;
 
 use RunCache\Core\PageCache;
 use RunCache\Core\Setting;
+use RunCache\Integrations\Multisite;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -152,7 +153,7 @@ class Dropin
             return false;
         }
 
-        $handler_section = $this->build_handler_section($page_cache_type);
+        $handler_section = $this->build_handler_section($this->network_page_cache_types());
         if ($handler_section === false) {
             return false;
         }
@@ -433,47 +434,206 @@ class Dropin
     }
 
     /**
-     * Builds the cache handler section for the active provider.
-     * The handler runs only when it matches the runtime page_cache_type.
+     * Builds the cache handler section for the network's providers.
      *
-     * @param string $page_cache_type Active provider type.
+     * One advanced-cache.php serves every site, and each site routes by
+     * its own config row, so the section embeds every handler family the
+     * network uses. The PHP-file family covers the php, nginx, and apache
+     * types; the Redis family covers redis; fastcgi needs no PHP handler.
+     *
+     * @param string[] $types Page-cache types in use across the network.
      * @return string|false Section content, or false on failure.
      */
-    private function build_handler_section(string $page_cache_type): string|false
+    private function build_handler_section(array $types): string|false
     {
-        if ($page_cache_type === 'redis') {
-            $body = $this->extract_handler_body('runcache-page-redis.php');
-            if ($body === false) {
-                return false;
-            }
+        $needs_redis = in_array('redis', $types, true);
+        $needs_php = count(array_intersect($types, self::PHP_HANDLER_TYPES)) > 0;
 
-            // The banner text keeps the literal marker string that
-            // Redis::remove_dropin() matches to recognize its drop-in.
-            return "// ===== Handler: Redis-backed page cache drop-in (includes/runcache-page-redis.php) =====\n\n"
-                . "if (\$runcache_page_cache_type !== 'redis') {\n"
-                . "    // This drop-in was not generated for the current provider.\n"
-                . "    return;\n"
-                . "}\n\n"
-                . $body;
+        if (!$needs_redis && !$needs_php) {
+            $types_list = implode("', '", $types);
+
+            return "// ===== No handler: providers '{$types_list}' do not use this drop-in =====\n";
         }
 
-        if (in_array($page_cache_type, self::PHP_HANDLER_TYPES, true)) {
-            $body = $this->extract_handler_body('runcache-page-php.php');
-            if ($body === false) {
-                return false;
-            }
-
-            $types = implode("', '", self::PHP_HANDLER_TYPES);
-
-            return "// ===== Handler: PHP file cache (includes/runcache-page-php.php) =====\n\n"
-                . "if (!in_array(\$runcache_page_cache_type, ['{$types}'], true)) {\n"
-                . "    // This drop-in was not generated for the current provider.\n"
-                . "    return;\n"
-                . "}\n\n"
-                . $body;
+        if ($needs_redis && $needs_php) {
+            return $this->build_combined_handler_section();
         }
 
-        return "// ===== No handler: provider '{$page_cache_type}' does not use this drop-in =====\n";
+        if ($needs_redis) {
+            return $this->build_redis_handler_section();
+        }
+
+        return $this->build_php_handler_section();
+    }
+
+    /**
+     * Builds the PHP file-cache handler section.
+     *
+     * @return string|false Section content, or false on failure.
+     */
+    private function build_php_handler_section(): string|false
+    {
+        $body = $this->extract_handler_body('runcache-page-php.php');
+        if ($body === false) {
+            return false;
+        }
+
+        $types = implode("', '", self::PHP_HANDLER_TYPES);
+
+        return "// ===== Handler: PHP file cache (includes/runcache-page-php.php) =====\n\n"
+            . "if (!in_array(\$runcache_page_cache_type, ['{$types}'], true)) {\n"
+            . "    // This drop-in was not generated for the current provider.\n"
+            . "    return;\n"
+            . "}\n\n"
+            . $body;
+    }
+
+    /**
+     * Builds the Redis page-cache handler section.
+     *
+     * @return string|false Section content, or false on failure.
+     */
+    private function build_redis_handler_section(): string|false
+    {
+        // The shared key mapping must come first, so the handler and
+        // the admin-side purger build keys from one implementation.
+        $shared = $this->extract_inline_body('runcache-redis-keys.php');
+        if ($shared === false) {
+            return false;
+        }
+
+        $body = $this->extract_handler_body('runcache-page-redis.php');
+        if ($body === false) {
+            return false;
+        }
+
+        $body = $this->drop_inlined_block($body, 'runcache-redis-keys-require');
+        if ($body === false) {
+            return false;
+        }
+
+        // The banner text keeps the literal marker string that
+        // Redis::remove_dropin() matches to recognize its drop-in.
+        return "// ===== Redis page-cache key mapping (includes/runcache-redis-keys.php) =====\n\n"
+            . $shared . "\n\n"
+            . "// ===== Handler: Redis-backed page cache drop-in (includes/runcache-page-redis.php) =====\n\n"
+            . "if (\$runcache_page_cache_type !== 'redis') {\n"
+            . "    // This drop-in was not generated for the current provider.\n"
+            . "    return;\n"
+            . "}\n\n"
+            . $body;
+    }
+
+    /**
+     * Builds one handler section with both families as guarded branches.
+     *
+     * The bodies keep their top-level returns: inside a conditional block
+     * a return still ends the drop-in include, so bypass paths behave as
+     * in the single-family shapes. The Redis banner text stays literal
+     * for Redis::remove_dropin() recognition.
+     *
+     * @return string|false Section content, or false on failure.
+     */
+    private function build_combined_handler_section(): string|false
+    {
+        $php_body = $this->extract_handler_body('runcache-page-php.php');
+        if ($php_body === false) {
+            return false;
+        }
+
+        $shared = $this->extract_inline_body('runcache-redis-keys.php');
+        if ($shared === false) {
+            return false;
+        }
+
+        $redis_body = $this->extract_handler_body('runcache-page-redis.php');
+        if ($redis_body === false) {
+            return false;
+        }
+
+        $redis_body = $this->drop_inlined_block($redis_body, 'runcache-redis-keys-require');
+        if ($redis_body === false) {
+            return false;
+        }
+
+        $types = implode("', '", self::PHP_HANDLER_TYPES);
+
+        return "// ===== Handler: PHP file cache (includes/runcache-page-php.php) =====\n\n"
+            . "if (in_array(\$runcache_page_cache_type, ['{$types}'], true)) {\n"
+            . $this->indent_body($php_body)
+            . "}\n\n"
+            . "// ===== Redis page-cache key mapping (includes/runcache-redis-keys.php) =====\n\n"
+            . $this->indent_body($shared)
+            . "\n"
+            . "// ===== Handler: Redis-backed page cache drop-in (includes/runcache-page-redis.php) =====\n\n"
+            . "if (\$runcache_page_cache_type === 'redis') {\n"
+            . $this->indent_body($redis_body)
+            . "}\n";
+    }
+
+    /**
+     * Indents an inlined body one level for a conditional wrapper.
+     *
+     * @param string $body Body content without the trailing newline.
+     * @return string Indented body with one trailing newline.
+     */
+    private function indent_body(string $body): string
+    {
+        $lines = preg_split('/\r?\n/', rtrim($body));
+        if ($lines === false) {
+            return rtrim($body) . "\n";
+        }
+
+        $indented = array_map(
+            static function (string $line): string {
+                return $line === '' ? '' : '    ' . $line;
+            },
+            $lines
+        );
+
+        return implode("\n", $indented) . "\n";
+    }
+
+    /**
+     * Collects the page-cache types in use across the network.
+     *
+     * The 'php' seed mirrors the config loader's fail-open default, so a
+     * child site with no saved settings still finds a handler.
+     *
+     * @return string[]
+     */
+    private function network_page_cache_types(): array
+    {
+        $types = ['php'];
+
+        if (function_exists('is_multisite') && is_multisite()
+            && function_exists('get_sites') && function_exists('get_blog_option')
+        ) {
+            $sites = get_sites(['number' => 500]);
+            foreach ($sites as $site) {
+                if (!$site instanceof \WP_Site) {
+                    continue;
+                }
+
+                $row = get_blog_option((int) $site->blog_id, 'runcache_page_cache_settings');
+                if (is_array($row) && isset($row['page_cache_type'])
+                    && is_string($row['page_cache_type']) && $row['page_cache_type'] !== ''
+                ) {
+                    $types[] = $row['page_cache_type'];
+                }
+            }
+
+            return array_values(array_unique($types));
+        }
+
+        $stored = $this->setting->get('page_cache');
+        if (is_array($stored) && isset($stored['page_cache_type'])
+            && is_string($stored['page_cache_type']) && $stored['page_cache_type'] !== ''
+        ) {
+            $types[] = $stored['page_cache_type'];
+        }
+
+        return array_values(array_unique($types));
     }
 
     /**
@@ -747,6 +907,32 @@ class Dropin
     }
 
     /**
+     * Refreshes the managed page cache drop-in after a rules or purger save.
+     * Runs on `runcache_rules_updated` and `runcache_purger_updated`.
+     *
+     * @return void
+     */
+    public static function refresh_page_cache_dropin(): void
+    {
+        $logger = new Logger();
+        try {
+            $dropin = new self($logger);
+
+            // Refresh only a drop-in RunCache already manages. Do not install
+            // a new one; enabling a feature is an admin action.
+            if (!$dropin->is_page_cache_dropin_installed()) {
+                return;
+            }
+
+            $dropin->install_page_cache_dropin();
+        } catch (\Throwable $e) {
+            $logger->error('Failed to refresh page cache drop-in after settings update', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
      * Removes the page cache drop-in.
      *
      * @return bool
@@ -805,6 +991,10 @@ class Dropin
             return false;
         }
 
+        // The foreign drop-in backup below needs the installed copy, so
+        // capture it before the overwrite.
+        $existing_content = false;
+
         // Check if target file exists
         if (file_exists($this->object_cache_dropin)) {
             $existing_content = file_get_contents($this->object_cache_dropin);
@@ -838,7 +1028,105 @@ class Dropin
         }
 
         $this->logger->info('Object cache dropin installed', ['component' => 'Dropin', 'dropin' => 'object']);
+
+        $this->purge_legacy_object_cache_keys();
+
         return true;
+    }
+
+    /**
+     * Purges the legacy unscoped object cache namespace.
+     *
+     * Keys under runcache:object:* are unreachable after the layout
+     * change, and a version gate misses in-memory shutdown writes.
+     *
+     * @return void
+     * @throws \RuntimeException When the Redis connection or authentication fails.
+     */
+    private function purge_legacy_object_cache_keys(): void
+    {
+        if (!class_exists('\\Redis')) {
+            $this->logger->info('Redis extension unavailable, skipped legacy object cache purge', ['component' => 'Dropin', 'dropin' => 'object']);
+            return;
+        }
+
+        if (!class_exists('\\RunCache\\Integrations\\RedisObjectCache')) {
+            $this->logger->info('Object cache integration unavailable, skipped legacy purge', ['component' => 'Dropin', 'dropin' => 'object']);
+            return;
+        }
+
+        try {
+            // The purge must reach the Redis that the site uses, so
+            // the resolution chain matches the object cache integration.
+            $settings = (new \RunCache\Integrations\RedisObjectCache($this->logger))->get_settings();
+
+            $host = (string) ($settings['host'] ?? '');
+            if ('' === $host) {
+                return;
+            }
+
+            $redis = new \Redis();
+            if (!$redis->connect($host, (int) ($settings['port'] ?? 6379), 5.0)) {
+                throw new \RuntimeException('Failed to connect to Redis server');
+            }
+
+            $username = (string) ($settings['username'] ?? '');
+            $password = (string) ($settings['password'] ?? '');
+            if ('' !== $username || '' !== $password) {
+                $auth_params = '' !== $username ? [$username] : [];
+                if ('' !== $password) {
+                    $auth_params[] = $password;
+                }
+
+                if (!$redis->auth($auth_params)) {
+                    throw new \RuntimeException('Redis authentication failed');
+                }
+            }
+
+            $database = isset($settings['database']) && null !== $settings['database']
+                ? (int) $settings['database']
+                : null;
+            if (null !== $database) {
+                $redis->select($database);
+            }
+
+            // A batch without matches would otherwise truncate the walk,
+            // so the extension retries each scan.
+            $redis->setOption(\Redis::OPT_SCAN, \Redis::SCAN_RETRY);
+            $redis->setOption(\Redis::OPT_READ_TIMEOUT, 1);
+
+            // The pattern stays fixed, because a derived one could delete
+            // a hand-written site-scoped family instead of legacy leftovers.
+            $pattern = 'runcache:object:*';
+            $iterator = null;
+            $purged = 0;
+
+            do {
+                $result = $redis->scan($iterator, $pattern, 500);
+                $keys = is_array($result) ? array_values(array_filter($result, 'is_string')) : [];
+
+                if ([] !== $keys) {
+                    if (method_exists($redis, 'unlink')) {
+                        $redis->unlink($keys);
+                    } else {
+                        $redis->del($keys);
+                    }
+                    $purged += count($keys);
+                }
+            } while (0 !== $iterator);
+
+            $this->logger->info('Legacy object cache purge finished', [
+                'component' => 'Dropin',
+                'dropin' => 'object',
+                'keys_purged' => $purged,
+            ]);
+        } catch (\Throwable $e) {
+            $this->logger->error('Legacy object cache purge failed', [
+                'component' => 'Dropin',
+                'dropin' => 'object',
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
@@ -878,7 +1166,9 @@ class Dropin
      * Write cache toggle marker file
      *
      * Creates a marker file in the cache directory to indicate
-     * that a cache type is enabled for the current hostname.
+     * that a cache type is enabled for the current site. On a
+     * subdirectory network the marker name carries the site path, so
+     * sibling sites keep their own markers.
      *
      * @param string $cache_type The cache type (e.g., 'nginx', 'runcloud-native')
      * @return void
@@ -889,7 +1179,7 @@ class Dropin
         $cache = new PageCache();
         $cache_dir = $cache->get_cache_directory();
         $hostname = $this->sanitize_hostname(Setting::get_site_host());
-        $toggle_file = $cache_dir . '/.enabled-' . $cache_type . '-' . $hostname;
+        $toggle_file = $cache_dir . '/.enabled-' . $cache_type . '-' . $hostname . Multisite::marker_path_suffix();
 
         $file->write($toggle_file, 'generated by RunCache');
     }
@@ -897,8 +1187,8 @@ class Dropin
     /**
      * Remove cache toggle marker file
      *
-     * Removes the marker file from the cache directory when
-     * a cache type is disabled for the current hostname.
+     * Removes this site's marker file from the cache directory when
+     * a cache type is disabled for the current site.
      *
      * @param string $cache_type The cache type (e.g., 'nginx', 'runcloud-native')
      * @return void
@@ -909,7 +1199,7 @@ class Dropin
         $cache = new PageCache();
         $cache_dir = $cache->get_cache_directory();
         $hostname = $this->sanitize_hostname(Setting::get_site_host());
-        $toggle_file = $cache_dir . '/.enabled-' . $cache_type . '-' . $hostname;
+        $toggle_file = $cache_dir . '/.enabled-' . $cache_type . '-' . $hostname . Multisite::marker_path_suffix();
 
         if ($file->exists($toggle_file)) {
             $file->delete($toggle_file);

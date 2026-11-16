@@ -2,6 +2,7 @@
 
 namespace RunCache\Core;
 
+use RunCache\Support\Environment;
 use RunCache\Support\Logger;
 use RunCache\Support\Validator;
 
@@ -416,6 +417,20 @@ class Cdn
     }
 
     /**
+     * Detect requests whose rewritten URLs an editor can store into content.
+     *
+     * The block editor saves attachment URLs from REST responses into post_content.
+     *
+     * @return bool
+     */
+    private function is_persisted_context(): bool
+    {
+        return is_admin()
+            || (defined('REST_REQUEST') && REST_REQUEST)
+            || (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST);
+    }
+
+    /**
      * Rewrite asset URL to CDN hostname
      *
      * @param string $url
@@ -431,7 +446,7 @@ class Cdn
             return $url;
         }
 
-        if (is_admin() || $this->is_admin_asset($url)) {
+        if ($this->is_persisted_context() || $this->is_admin_asset($url)) {
             return $url;
         }
 
@@ -450,7 +465,9 @@ class Cdn
             return $url;
         }
 
-        $is_wp_content = strpos($path, '/wp-content/') !== false;
+        // Bedrock keeps the content dir at /app, so the path comes from the layout profile.
+        $content_url_path = Environment::instance()->get_content_url_path();
+        $is_wp_content = false !== strpos($path, $content_url_path . '/');
         $allowed_extensions = $settings['allowed_extensions'] ?? null;
 
         if (!$is_wp_content && !$this->is_extension_allowed($url, $allowed_extensions)) {
@@ -526,7 +543,9 @@ class Cdn
         $extensions_pattern = $this->build_extensions_pattern($allowed_extensions);
 
         foreach ($domains as $site_domain) {
-            $pattern = '/((?:https?:)?\/\/)' . preg_quote($site_domain, '/') . '(\/(?:[^"\'\\s]*\/)?wp-content\/[^"\'\\s]*\.(?:' . $extensions_pattern . '))(\\?[^"\'\\s]*)?/i';
+            // Bedrock keeps the content dir at /app, so the path comes from the layout profile.
+            $content_url_path = trim(Environment::instance()->get_content_url_path(), '/');
+            $pattern = '/((?:https?:)?\/\/)' . preg_quote($site_domain, '/') . '(\/(?:[^"\'\\s]*\/)?' . preg_quote($content_url_path, '/') . '\/[^"\'\\s]*\.(?:' . $extensions_pattern . '))(\\?[^"\'\\s]*)?/i';
             $content = preg_replace_callback($pattern, function ($matches) use ($cdn_host_clean) {
                 $scheme_prefix = $matches[1] ?? '//';
                 $path = $matches[2] ?? '';
@@ -693,10 +712,14 @@ class Cdn
             return false;
         }
 
+        // Bedrock serves core under /wp, so the admin prefix comes from the layout profile.
+        $environment = Environment::instance();
+        $prefix = rtrim($environment->get_admin_url_prefix(), '/');
+
         $admin_paths = [
-            '/wp-admin/',
-            '/wp-includes/js/',
-            '/wp-includes/css/',
+            $prefix . '/wp-admin/',
+            $prefix . '/wp-includes/js/',
+            $prefix . '/wp-includes/css/',
         ];
 
         foreach ($admin_paths as $admin_path) {

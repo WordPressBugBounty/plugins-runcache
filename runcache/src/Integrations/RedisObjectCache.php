@@ -41,6 +41,7 @@ class RedisObjectCache extends Redis
 
         if ($this->is_object_cache_enabled()) {
             add_action('runcache_after_purge_all', [$this, 'purge_object_cache'], 15);
+            add_action('runcache_after_purge_network', [$this, 'purge_network_object_cache'], 15);
         }
     }
 
@@ -92,32 +93,22 @@ class RedisObjectCache extends Redis
             return $rcwp_config;
         }
 
-        return [];
+        // Verification must test what the drop-in resolves, so the
+        // shared settings chain applies when no object record exists.
+        return parent::get_settings();
     }
 
     /**
      * Enable Redis object cache
+     *
+     * The object-cache drop-in reads connection settings from the
+     * generated config channel; wp-config.php is never written.
      *
      * @return bool
      */
     public function enable(): bool
     {
         $this->logger->info('Enable object cache', ['provider' => 'Redis Object Cache']);
-
-        $settings = $this->get_settings();
-        if (empty($settings)) {
-            $this->logger->error('Cannot enable Redis object cache: no settings available');
-            return false;
-        }
-
-        try {
-            $this->update_wp_config($settings);
-        } catch (\Exception $e) {
-            $this->logger->error('Failed to write Redis object cache constants to wp-config.php', [
-                'error' => $e->getMessage(),
-            ]);
-            return false;
-        }
 
         $dropin = new Dropin();
         if (!$dropin->install_object_cache_dropin()) {
@@ -131,26 +122,68 @@ class RedisObjectCache extends Redis
     /**
      * Disable Redis object cache
      *
+     * On a multisite network the drop-in stays installed while a sibling
+     * site still has the object cache enabled, because one drop-in serves
+     * every site. The caller stamps the disabled state into this site's
+     * config row.
+     *
      * @return bool
      */
     public function disable(): bool
     {
-        if (!$this->is_other_cache_using_redis()) {
-            $this->update_wp_config([]);
-        }
-
         $this->logger->info('Disable object cache', ['provider' => 'Redis Object Cache']);
+
+        if (Multisite::is_multisite() && $this->network_still_uses_object_cache()) {
+            return true;
+        }
 
         $dropin = new Dropin();
         return $dropin->remove_object_cache_dropin();
     }
 
     /**
+     * Checks the config channel for a sibling site that still uses the drop-in.
+     *
+     * A sibling row without the flag predates the per-site switch and
+     * counts as enabled, so an upgrade never removes a drop-in that
+     * others rely on. Must stay in sync with
+     * runcache_object_cache_persistent_enabled() in includes/object-cache.php.
+     *
+     * @return bool True when any other site has the object cache on.
+     */
+    private function network_still_uses_object_cache(): bool
+    {
+        if (!defined('RUNCACHE_CONFIG_FILE') || !is_readable(RUNCACHE_CONFIG_FILE)) {
+            return true;
+        }
+
+        // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_include -- Reads the plugin-generated channel the drop-ins include.
+        $loaded = include RUNCACHE_CONFIG_FILE;
+        if (!is_array($loaded) || !is_array($loaded['sites'] ?? null)) {
+            return true;
+        }
+
+        $current_key = (new Multisite())->get_config_key();
+
+        foreach ($loaded['sites'] as $row_key => $row) {
+            if (!is_array($row) || $row_key === $current_key) {
+                continue;
+            }
+
+            if (filter_var($row['object_cache_enabled'] ?? true, FILTER_VALIDATE_BOOLEAN)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Verify Redis object cache connection
      *
-     * Runs four ordered gates: database status, Redis connection,
-     * wp-config constants, and drop-in presence. A missing drop-in
-     * is installed automatically once the connection is proven.
+     * Four ordered gates prove the database status, the Redis
+     * connection, the effective connection, and the drop-in presence,
+     * so a proven connection auto-installs a missing drop-in.
      *
      * @return array|bool True when verified, or an error array.
      */
@@ -192,12 +225,21 @@ class RedisObjectCache extends Redis
             ];
         }
 
-        // Gate 3: the drop-in reads these constants, so they must match the saved settings.
+        // Verification must prove the drop-in's real resolution, so the
+        // channel is rebuilt (idempotent) and read back.
         $configured_settings = $this->get_constant_config();
-        if (empty($configured_settings) || !$this->has_matching_settings($settings, $configured_settings)) {
+        if (!empty($configured_settings) && !$this->has_matching_settings($settings, $configured_settings)) {
             return [
                 'verified' => false,
-                'message' => 'Redis object cache constants are missing or do not match the saved settings.',
+                'message' => 'Hand-written RUNCACHE_REDIS_* constants do not match the saved settings.',
+            ];
+        }
+
+        $expected_connection = $this->get_connection_config();
+        if (!empty($expected_connection) && !$this->channel_carries_connection($expected_connection)) {
+            return [
+                'verified' => false,
+                'message' => 'The generated cache config does not carry the Redis connection. Check the cache directory permissions.',
             ];
         }
 
@@ -234,6 +276,55 @@ class RedisObjectCache extends Redis
         }
 
         return true;
+    }
+
+    /**
+     * Rebuild the generated config channel and confirm it carries the
+     * effective Redis connection the drop-in will resolve.
+     *
+     * @param array $expected_connection Effective connection settings.
+     * @return bool
+     */
+    private function channel_carries_connection(array $expected_connection): bool
+    {
+        $setting = new Setting();
+        $setting->write_config_file();
+
+        // Drop-ins include this channel file before WordPress loads, so
+        // the same include reads it back here.
+        $channel_redis = [];
+        if (defined('RUNCACHE_CONFIG_FILE') && is_readable(RUNCACHE_CONFIG_FILE)) {
+            // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_include -- Reads the plugin-generated channel the drop-ins include.
+            $loaded = include RUNCACHE_CONFIG_FILE;
+            $config_key = (new Multisite())->get_config_key();
+            $site = is_array($loaded) ? ($loaded['sites'][$config_key] ?? null) : null;
+            if (is_array($site) && is_array($site['redis'] ?? null)) {
+                $channel_redis = $site['redis'];
+            }
+        }
+
+        return !empty($channel_redis) && $this->has_matching_settings($expected_connection, $channel_redis);
+    }
+
+    /**
+     * Get scoped key prefix for object cache reads.
+     *
+     * Global groups are network-wide, so the scope is one network and
+     * the identity is the writer-baked install identifier.
+     *
+     * @param string|null $base_key Optional base-prefix override.
+     * @return string
+     */
+    protected function get_scoped_key_prefix(?string $base_key = null): string
+    {
+        $base = rtrim($this->get_key_prefix($base_key), ':');
+        $identifier = Multisite::object_cache_identifier();
+
+        if ('' !== $identifier) {
+            return $base . ':' . $identifier . ':';
+        }
+
+        return $base . ':';
     }
 
     /**
@@ -274,7 +365,10 @@ class RedisObjectCache extends Redis
     }
 
     /**
-     * Purge Redis object cache keys when the global purge action runs
+     * Purge Redis object cache keys when the site purge action runs
+     *
+     * wp_cache_flush() clears the current blog only, so a site purge no
+     * longer wipes the sibling sites' object cache.
      *
      * @return void
      */
@@ -295,14 +389,56 @@ class RedisObjectCache extends Redis
             if (wp_cache_flush()) {
                 $this->logger->info('Object cache flushed successfully', [
                     'provider' => 'Redis Object Cache',
+                    'scope' => 'site',
                 ]);
             } else {
                 $this->logger->error('Object-cache flush failed', [
                     'provider' => 'Redis Object Cache',
+                    'scope' => 'site',
                 ]);
             }
         } catch (\Throwable $throwable) {
             $this->logger->error('Failed to run wp_cache_flush()', [
+                'provider' => 'Redis Object Cache',
+                'error' => $throwable->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Purge every object-cache key of the whole network
+     *
+     * Hooked to the network purge only.
+     *
+     * @return void
+     */
+    public function purge_network_object_cache(): void
+    {
+        if (!$this->is_object_cache_enabled()) {
+            return;
+        }
+
+        if (!function_exists('wp_cache_flush_network')) {
+            $this->logger->error('Network object-cache flush function is unavailable', [
+                'provider' => 'Redis Object Cache',
+            ]);
+            return;
+        }
+
+        try {
+            if (wp_cache_flush_network()) {
+                $this->logger->info('Network object cache flushed successfully', [
+                    'provider' => 'Redis Object Cache',
+                    'scope' => 'network',
+                ]);
+            } else {
+                $this->logger->error('Network object-cache flush failed', [
+                    'provider' => 'Redis Object Cache',
+                    'scope' => 'network',
+                ]);
+            }
+        } catch (\Throwable $throwable) {
+            $this->logger->error('Failed to run wp_cache_flush_network()', [
                 'provider' => 'Redis Object Cache',
                 'error' => $throwable->getMessage(),
             ]);

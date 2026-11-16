@@ -98,6 +98,111 @@ class Validator
     }
 
     /**
+     * Find the network site that owns a URL.
+     *
+     * The owner is the site whose registered domain matches and whose path
+     * is the longest prefix of the URL path. Unknown hosts have no owner.
+     *
+     * @param string $url URL to check.
+     * @return int|false Owning blog id, or false when no site owns the URL.
+     */
+    public function url_owner_blog_id(string $url): int|false
+    {
+        $host = wp_parse_url($url, PHP_URL_HOST);
+        if (!is_string($host) || $host === '') {
+            return false;
+        }
+        $host = strtolower(trim($host, '.'));
+
+        if (!is_multisite()) {
+            $site_host = wp_parse_url(home_url('/'), PHP_URL_HOST);
+
+            return is_string($site_host) && strtolower(trim($site_host, '.')) === $host
+                ? (int) get_current_blog_id()
+                : false;
+        }
+
+        $sites = get_sites(['domain' => $host, 'number' => 200]);
+        if (!is_array($sites) || $sites === []) {
+            return false;
+        }
+
+        $path = wp_parse_url($url, PHP_URL_PATH);
+        $url_path = rtrim('/' . trim(is_string($path) ? $path : '/', '/'), '/') . '/';
+
+        $owner_id = false;
+        $owner_length = -1;
+        foreach ($sites as $site) {
+            if (!$site instanceof \WP_Site) {
+                continue;
+            }
+
+            $site_path = rtrim('/' . trim((string) $site->path, '/'), '/') . '/';
+            if (!str_starts_with($url_path, $site_path)) {
+                continue;
+            }
+
+            if (strlen($site_path) > $owner_length) {
+                $owner_length = strlen($site_path);
+                $owner_id = (int) $site->blog_id;
+            }
+        }
+
+        return $owner_id;
+    }
+
+    /**
+     * Check a URL belongs to a site the current user manages.
+     *
+     * URLs on hosts outside the network are out of scope for every actor:
+     * purging one would create a foreign bucket under the shared cache root.
+     * Network admins skip only the per-site management check. This check
+     * gates actor actions only; cron and content hooks run without a user
+     * and must not call it.
+     *
+     * @param string $url URL to check.
+     * @return bool True when the actor may purge or preload this URL.
+     */
+    public function url_in_actor_scope(string $url): bool
+    {
+        $owner_id = $this->url_owner_blog_id($url);
+        if ($owner_id === false) {
+            return false;
+        }
+
+        if (current_user_can('manage_network')) {
+            return true;
+        }
+
+        return $this->user_can_manage_site($owner_id);
+    }
+
+    /**
+     * Check a capability for one site without the deprecated wrapper.
+     *
+     * @param int $site_id Site to check.
+     * @return bool True when the current user manages the site.
+     */
+    private function user_can_manage_site(int $site_id): bool
+    {
+        if (function_exists('current_user_can_for_site')) {
+            return current_user_can_for_site($site_id, 'manage_options');
+        }
+
+        // WP 5.9-6.6 has no site-based helper. Mirror core: switch only on multisite,
+        // because switch_to_blog() is undefined on single site.
+        if (!is_multisite()) {
+            return current_user_can('manage_options');
+        }
+
+        switch_to_blog($site_id);
+        $can = current_user_can('manage_options');
+        restore_current_blog();
+
+        return $can;
+    }
+
+    /**
      * Normalize a list of URLs, sanitizing and ensuring uniqueness
      *
      * @param array<string|int, mixed>|string $urls URLs to normalize

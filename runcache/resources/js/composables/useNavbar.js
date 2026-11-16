@@ -7,8 +7,15 @@ import {
     Columns3Cog,
     ArrowUpDown,
 } from 'lucide-vue-next'
+import { toast } from 'vue-sonner'
 import { cacheApi } from '@/api/cache'
-import { startPreload, usePreloader, checkPreloadStatus, cleanup } from '@/utils/preloader'
+import {
+    startPreload,
+    clearPreloadQueue,
+    usePreloader,
+    checkPreloadStatus,
+    cleanup,
+} from '@/utils/preloader'
 
 // Icon mapping
 const iconMap = {
@@ -23,6 +30,7 @@ export function useNavbar() {
     const router = useRouter()
     const cachedPages = ref(0)
     const isPurging = ref(false)
+    const isStoppingPreload = ref(false)
     const { isPreloading, preloadMessage } = usePreloader()
 
     // Get navigation from router - single source of truth
@@ -55,6 +63,35 @@ export function useNavbar() {
         }
     }
 
+    const stopPreload = async () => {
+        if (isStoppingPreload.value || !isPreloading.value) {
+            return
+        }
+
+        const confirmed = confirm('Stop the preload process? Remaining URLs will be skipped.')
+
+        if (!confirmed) {
+            return
+        }
+
+        isStoppingPreload.value = true
+
+        try {
+            const stopped = await clearPreloadQueue()
+
+            if (stopped) {
+                toast.success('Preload stopped')
+            } else {
+                toast.error('Failed to stop preload')
+            }
+        } catch (error) {
+            console.error('Failed to stop preload:', error)
+            toast.error('Failed to stop preload')
+        } finally {
+            isStoppingPreload.value = false
+        }
+    }
+
     const purgeCache = async () => {
         const confirmed = confirm(
             'Are you sure you want to purge all cached pages? This action cannot be undone.'
@@ -81,9 +118,11 @@ export function useNavbar() {
         cachedPages,
         isPreloading,
         isPurging,
+        isStoppingPreload,
         preloadMessage,
         loadStats,
         preloadCache,
+        stopPreload,
         purgeCache,
         checkPreloadStatus,
         cleanup,

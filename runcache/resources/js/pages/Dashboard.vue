@@ -26,6 +26,9 @@
             <!-- Multisite Notice for subdirectory setup on main site -->
             <MultisiteNotice v-if="showMultisiteNotice" />
 
+            <!-- WP_CACHE missing: failed write on classic, guided step on Bedrock -->
+            <WpCacheNotice v-if="showWpCacheNotice" :wp-cache="cacheSettings.wp_cache" />
+
             <DashboardStats :cache-enabled="cacheEnabled" />
 
             <DashboardCacheConfiguration :cache-enabled="cacheEnabled" />
@@ -45,6 +48,7 @@ import GetStarted from '@/components/GetStarted.vue'
 import DashboardCacheConfiguration from '@/components/DashboardCacheConfiguration.vue'
 import DashboardSkeleton from '@/components/DashboardSkeleton.vue'
 import MultisiteNotice from '@/components/MultisiteNotice.vue'
+import WpCacheNotice from '@/components/WpCacheNotice.vue'
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 
 const pagePreloader = usePagePreloader()
@@ -112,6 +116,7 @@ const saveSettings = async ({ enable = cacheEnabled.value, loadingState = null }
         const settings = await cacheApi.saveSettings({ enable })
         const newCacheEnabled = Boolean(settings.enable)
         cacheEnabled.value = newCacheEnabled
+        cacheSettings.value = settings
         return settings
     } catch (error) {
         console.error('Save settings error:', error)
@@ -144,6 +149,12 @@ const showMultisiteNotice = computed(() => {
         multisite.value.is_main_site &&
         isNginx
     )
+})
+
+// Check if the WP_CACHE notice should be shown
+const showWpCacheNotice = computed(() => {
+    const wpCache = cacheSettings.value?.wp_cache
+    return Boolean(cacheEnabled.value && wpCache && wpCache.active === false)
 })
 
 onMounted(async () => {

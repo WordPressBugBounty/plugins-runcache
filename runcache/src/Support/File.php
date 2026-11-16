@@ -14,25 +14,27 @@ class File
      */
     private static ?\WP_Filesystem_Base $wp_fs = null;
 
+    /**
+     * Writes finish in milliseconds, so a long lock wait means a fault.
+     */
     private const LOCK_ATTEMPTS = 10;
     private const LOCK_RETRY_MICROSECONDS = 50000;
 
     /**
-     * Optional logger. Only the lock methods log degradation events.
-     * Every other method stays silent.
+     * The logger falls back to a default instance, so every call logs.
      *
-     * @var Logger|null
+     * @var Logger
      */
-    private ?Logger $logger = null;
+    private Logger $logger;
 
     /**
-     * Initialize file functionality.
+     * The logger is optional, so null becomes a default instance.
      *
-     * @param Logger|null $logger
+     * @param Logger|null $logger Optional logger; null means the default.
      */
     public function __construct(?Logger $logger = null)
     {
-        $this->logger = $logger;
+        $this->logger = $logger ?? new Logger();
     }
 
     /**
@@ -249,10 +251,10 @@ class File
     /**
      * Update a PHP `return array(...)` config file under a best-effort lock.
      *
-     * One writer holds an advisory lock across the read-merge-write cycle.
-     * Lock failures degrade to last-writer-wins. They never fail the write.
+     * Concurrent writers would lose sibling rows, so the lock covers the
+     * read-merge-write; lock failure degrades to last-writer-wins.
      *
-     * @param string $path Path to a PHP file holding one `return array(...)`.
+     * @param string   $path   Path to a PHP file holding one `return array(...)`.
      * @param callable $mutate Receives the current array, returns the new array.
      * @return bool True when the write succeeded, lock held or not.
      * @throws \Throwable Re-throws mutator exceptions after lock release.
@@ -262,10 +264,9 @@ class File
         $handle = $this->acquire_lock($this->lock_path_for($path));
 
         try {
-            // The read happens inside the lock so a concurrent writer's
-            // change cannot be lost between read and write.
+            // A concurrent writer's change would be lost between read and
+            // write, so the read happens inside the lock.
             $updated = $mutate($this->read_php_array($path));
-
             if (!is_array($updated)) {
                 return false;
             }
@@ -285,8 +286,8 @@ class File
     /**
      * Build the lock file path for a config file.
      *
-     * This is the only place that builds the lock path. Callers such as
-     * uninstall() call it. Lock and data file share one filesystem.
+     * An advisory lock needs lock and data file on one filesystem, so
+     * the lock path is derived here and nowhere else.
      *
      * @param string $path Data file path.
      * @return string Lock file path.
@@ -299,8 +300,8 @@ class File
     /**
      * Try to acquire an exclusive non-blocking lock with a bounded retry.
      *
-     * The retry is bounded and non-blocking. PHP has no timeout for a
-     * blocking flock(), so a hung holder would hang the request forever.
+     * PHP has no timeout for a blocking flock(), so a hung holder would
+     * hang the request; the retry stays bounded and non-blocking.
      *
      * @param string $lock_path Lock file path.
      * @return resource|null Lock handle, or null when locking is unavailable.
@@ -308,7 +309,7 @@ class File
     private function acquire_lock(string $lock_path)
     {
         if (!function_exists('flock')) {
-            $this->logger?->info('File lock unavailable: flock() is disabled; continuing unlocked', [
+            $this->logger->info('File lock unavailable: flock() is disabled; continuing unlocked', [
                 'lock' => $lock_path,
             ]);
             return null;
@@ -316,8 +317,8 @@ class File
 
         // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen -- Lock files use local fopen; WP_Filesystem cannot hand out lock handles.
         $handle = @fopen($lock_path, 'c');
-        if ($handle === false) {
-            $this->logger?->warning('File lock could not be created; continuing unlocked', [
+        if (false === $handle) {
+            $this->logger->warning('File lock could not be created; continuing unlocked', [
                 'lock' => $lock_path,
             ]);
             return null;
@@ -325,8 +326,7 @@ class File
 
         for ($attempt = 0; $attempt < self::LOCK_ATTEMPTS; $attempt++) {
             if (@flock($handle, LOCK_EX | LOCK_NB)) {
-                // Widen the mode after the lock. The FPM user and the CLI
-                // user can differ, and the file holds no data.
+                // FPM and CLI users can differ, so the mode widens only after the lock.
                 // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_chmod -- Lock files use local permissions.
                 @chmod($lock_path, 0666);
 
@@ -338,7 +338,7 @@ class File
 
         // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose -- Local lock file handle.
         @fclose($handle);
-        $this->logger?->warning('File lock stayed busy; continuing unlocked', [
+        $this->logger->warning('File lock stayed busy; continuing unlocked', [
             'lock' => $lock_path,
         ]);
 
@@ -366,8 +366,8 @@ class File
     /**
      * Read a PHP file that contains one `return array(...)`.
      *
-     * A missing, unreadable, or corrupt file starts from an empty array so a
-     * later write self-heals the file. Corrupt files log a warning.
+     * A later write can self-heal the file, so a missing or corrupt file
+     * starts from an empty array; corrupt files log a warning.
      *
      * @param string $path Config file path.
      * @return array
@@ -389,15 +389,15 @@ class File
         } catch (\Throwable $exception) {
             $parse_error = $exception;
         } finally {
-            // Discard stray output a corrupted file may emit on include.
-            // Close only our own buffer, never an outer one.
+            // A corrupted file can emit stray output on include, and only
+            // our own buffer may be closed, never an outer one.
             if (ob_get_level() > $ob_level) {
                 ob_end_clean();
             }
         }
 
-        if ($parse_error !== null) {
-            $this->logger?->warning('PHP config file could not be parsed; starting from an empty array', [
+        if (null !== $parse_error) {
+            $this->logger->warning('PHP config file could not be parsed; starting from an empty array', [
                 'path' => $path,
                 'error' => $parse_error->getMessage(),
             ]);
@@ -406,7 +406,7 @@ class File
         }
 
         if (!is_array($loaded)) {
-            $this->logger?->warning('PHP config file did not return an array; starting from an empty array', [
+            $this->logger->warning('PHP config file did not return an array; starting from an empty array', [
                 'path' => $path,
             ]);
 
@@ -419,8 +419,8 @@ class File
     /**
      * Render a PHP config file body: open tag, ABSPATH guard, one return.
      *
-     * This is the only place that composes the file text. var_export
-     * serializes data only, so plugin-written content can never contain code.
+     * Plugin-written content must never contain code, and var_export
+     * serializes data only.
      *
      * @param array $data Config data to store.
      * @return string File content.
@@ -541,7 +541,7 @@ class File
     /**
      * Ensure the RunCache config directory exists with protection files.
      *
-     * Creates uploads/runcache/ when missing and writes an index.html
+     * Creates uploads/runcache/ when missing and writes an index.php
      * sentinel plus an .htaccess deny file so generated configuration
      * files are not exposed directly on Apache or LiteSpeed servers.
      *
@@ -559,9 +559,9 @@ class File
             return false;
         }
 
-        $index_file = $dir . 'index.html';
+        $index_file = $dir . 'index.php';
         if (!$this->exists($index_file)) {
-            $this->write($index_file, '<!-- Silence is golden - RunCache protected directory -->');
+            $this->write($index_file, '<?php' . PHP_EOL . '// Silence is golden - RunCache protected directory');
         }
 
         $htaccess_file = $dir . '.htaccess';
@@ -679,6 +679,9 @@ class File
 
     /**
      * Locate wp-config.php — checks both ABSPATH and one directory above.
+     *
+     * On Bedrock this is the do-not-edit stub, so writers must use
+     * Environment::get_writable_config_path() instead.
      *
      * @return string|false The normalized path to wp-config.php, or false if not found
      */

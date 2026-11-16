@@ -76,6 +76,19 @@
                             </button>
 
                             <button
+                                v-if="isPreloading"
+                                type="button"
+                                @click.prevent="handleStopPreload"
+                                :disabled="isStoppingPreload"
+                                class="rce-flex rce-items-center rce-w-full rce-px-3 rce-py-3 rce-text-sm rce-font-medium rce-text-primary-700 hover:rce-text-primary-600 hover:rce-bg-gray-50 rce-transition-colors rce-duration-150 rce-rounded-lg disabled:rce-opacity-60 disabled:rce-cursor-not-allowed">
+                                <CircleStop
+                                    :size="20"
+                                    :stroke-width="1.5"
+                                    class="rce-mr-3 rce-flex-shrink-0" />
+                                Stop preload
+                            </button>
+
+                            <button
                                 type="button"
                                 @click.prevent="handlePurge"
                                 :disabled="isPurging"
@@ -102,7 +115,14 @@
 
 <script setup>
 import { ref, watch } from 'vue'
-import { Menu, X, LoaderCircle, LoaderPinwheel, SquareBottomDashedScissors } from 'lucide-vue-next'
+import {
+    Menu,
+    X,
+    LoaderCircle,
+    LoaderPinwheel,
+    SquareBottomDashedScissors,
+    CircleStop,
+} from 'lucide-vue-next'
 import { Drawer, DrawerContent, DrawerTrigger } from '@/components/ui/drawer'
 import AppLogo from './AppLogo.vue'
 
@@ -123,13 +143,17 @@ defineProps({
         type: Boolean,
         default: false,
     },
+    isStoppingPreload: {
+        type: Boolean,
+        default: false,
+    },
     preloadMessage: {
         type: String,
         default: '',
     },
 })
 
-const emit = defineEmits(['preload', 'purge', 'menu-closed'])
+const emit = defineEmits(['preload', 'purge', 'stop-preload', 'menu-closed'])
 
 const isMenuOpen = ref(false)
 const menuButtonRef = ref(null)
@@ -149,6 +173,10 @@ watch(isMenuOpen, (isOpen, wasOpen) => {
 
 const handlePreload = () => {
     emit('preload')
+}
+
+const handleStopPreload = () => {
+    emit('stop-preload')
 }
 
 const handlePurge = () => {

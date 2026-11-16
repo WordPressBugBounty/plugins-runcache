@@ -46,7 +46,8 @@ class BunnyCDN
 
     public const API_BASE_URL = 'https://api.bunny.net';
     public const ENDPOINT_PULL_ZONES = '/pullzone';
-    public const ENDPOINT_PURGE_CACHE = '/cache';
+    public const ENDPOINT_PURGE_CACHE = '/purgeCache';
+    public const ENDPOINT_PURGE_URL = '/purge';
 
     /**
      * @param Logger|null $logger
@@ -307,7 +308,7 @@ class BunnyCDN
             }
 
             $endpoint = self::ENDPOINT_PULL_ZONES . '/' . $settings['pull_zone_id'] . self::ENDPOINT_PURGE_CACHE;
-            $response = $this->make_request('POST', $endpoint, ['purgeAll' => true], $settings['api_key']);
+            $response = $this->make_request('POST', $endpoint, null, $settings['api_key']);
 
             if (is_wp_error($response)) {
                 throw new Exception($response->get_error_message());
@@ -326,8 +327,6 @@ class BunnyCDN
      */
     public function purge_post_cache(int $post_id, $urls): bool
     {
-        $response_body = [];
-
         try {
             $settings = $this->get_settings();
             if (empty($settings['api_key']) || empty($settings['pull_zone_id'])) {
@@ -339,21 +338,19 @@ class BunnyCDN
                 return true;
             }
 
-            $endpoint = self::ENDPOINT_PULL_ZONES . '/' . $settings['pull_zone_id'] . self::ENDPOINT_PURGE_CACHE;
-            $response = $this->make_request('POST', $endpoint, ['urls' => $normalized_urls], $settings['api_key']);
+            // Bunny purges one URL per request on /purge; no list endpoint exists.
+            $failures = [];
+            foreach ($normalized_urls as $url) {
+                $endpoint = self::ENDPOINT_PURGE_URL . '?url=' . rawurlencode($url);
+                $response = $this->make_request('POST', $endpoint, null, $settings['api_key']);
 
-            if (is_wp_error($response)) {
-                throw new Exception($response->get_error_message());
+                if (is_wp_error($response)) {
+                    $failures[] = $url . ': ' . $response->get_error_message();
+                }
             }
 
-            $response_body = json_decode(wp_remote_retrieve_body($response), true) ?? [];
-            $errors_raw = $response_body['errors'] ?? $response_body['Errors'] ?? [];
-            $errors = array_filter(array_map('strval', (array) $errors_raw));
-            $success_flag = filter_var($response_body['success'] ?? $response_body['Success'] ?? null, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
-
-            if ($success_flag === false || !empty($errors)) {
-                $error_message = $response_body['message'] ?? implode(' | ', $errors) ?: 'BunnyCDN reported a failed purge';
-                throw new Exception($error_message);
+            if (!empty($failures)) {
+                throw new Exception(implode(' | ', $failures));
             }
 
             return true;

@@ -14,8 +14,8 @@
                         <li>Redis server should be properly secured if exposed to the internet</li>
                         <li>Consider using a Redis password in production environments</li>
                         <li>
-                            All RunCache entries will be stored with 'runcache:' prefix for easy
-                            management
+                            All RunCache entries are stored under the key prefix below (default
+                            'runcache:') for easy management
                         </li>
                         <li>Default Redis database (0) will be used for better compatibility</li>
                     </ul>
@@ -51,6 +51,20 @@
                     <div class="rce-space-y-2">
                         <Label for="redis-password">Password (optional)</Label>
                         <Input id="redis-password" v-model="form.password" type="password" />
+                    </div>
+
+                    <div class="rce-space-y-2">
+                        <Label for="redis-key">Key prefix</Label>
+                        <Input
+                            id="redis-key"
+                            v-model="form.key"
+                            :disabled="keyLocked"
+                            placeholder="runcache:"
+                            type="text"
+                            @blur="normalizeKeyPrefix" />
+                        <p v-if="keyLocked" class="rce-text-sm rce-text-gray-600">
+                            A Redis key constant in wp-config.php overrides this field.
+                        </p>
                     </div>
 
                     <div class="rce-pt-2">
@@ -94,7 +108,11 @@ const form = ref({
     port: '6379',
     username: '',
     password: '',
+    key: 'runcache:',
 })
+
+// A wp-config constant owns the key prefix, so the input stays read-only.
+const keyLocked = ref(false)
 
 // Query functions
 function useRedisSettingsQuery() {
@@ -141,11 +159,23 @@ watch(
                 port: settings.port || form.value.port,
                 username: settings.username || '',
                 password: settings.password || '',
+                key: settings.key || 'runcache:',
             }
+            keyLocked.value = Boolean(settings.key_locked)
         }
     },
     { immediate: true }
 )
+
+// Mirror the server-side key rules, so the value round-trips unchanged.
+const normalizeKeyPrefix = () => {
+    const base = form.value.key
+        .trim()
+        .replace(/[^A-Za-z0-9._:-]/g, '')
+        .slice(0, 100)
+        .replace(/:+$/, '')
+    form.value.key = base ? `${base}:` : 'runcache:'
+}
 
 // Watch save mutation state
 watch(

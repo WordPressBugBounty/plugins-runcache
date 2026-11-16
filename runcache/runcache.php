@@ -3,7 +3,7 @@
  * Plugin Name: RunCache – Full-Page, Object, and Edge Caching
  * Plugin URI: https://runcloud.io/runcache
  * Description: Supercharge your WordPress site with lightning-fast page loads. RunCache delivers instant page speeds through intelligent caching, automatic content updates, and simple one-click optimization.
- * Version: 1.1.0
+ * Version: 1.3.0
  * Author: RunCloud
  * Author URI: https://runcloud.io
  * License: GPL v2 or later
@@ -20,8 +20,8 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-// Define plugin constants
-define('RUNCACHE_VERSION', '1.1.0');
+// Plugin and runtime values, so other modules need no literals.
+define('RUNCACHE_VERSION', '1.3.0');
 define('RUNCACHE_PLUGIN_NAME', 'RunCache');
 define('RUNCACHE_PLUGIN_FILE', __FILE__);
 define('RUNCACHE_PLUGIN_DIR', plugin_dir_path(__FILE__));
@@ -31,12 +31,9 @@ define('RUNCACHE_PLUGIN_BASENAME', plugin_basename(__FILE__));
 if (!defined('RUNCACHE_CACHE_DIRECTORY')) {
     define('RUNCACHE_CACHE_DIRECTORY', WP_CONTENT_DIR . '/cache/runcache/');
 }
-
-// Generated per-site cache config, shared by all sites on multisite.
 if (!defined('RUNCACHE_CONFIG_FILE')) {
     define('RUNCACHE_CONFIG_FILE', WP_CONTENT_DIR . '/runcache-config.php');
 }
-
 define('RUNCACHE_CACHE_TYPE_PHP', 'PHP');
 define('RUNCACHE_CACHE_TYPE_APACHE', 'Apache');
 define('RUNCACHE_CACHE_TYPE_NGINX', 'NGINX');
@@ -69,7 +66,7 @@ spl_autoload_register(function ($class) {
     }
 });
 
-// Initialize the plugin
+// The plugin hooks every request, so setup runs at init time.
 function runcache_init() {
     // WP core sends its own nonce for heartbeat pings; this is a read-only
     // gate that skips heavy initialization and processes no form data.

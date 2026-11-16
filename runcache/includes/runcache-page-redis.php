@@ -27,6 +27,17 @@ if (!function_exists('runcache_should_cache')) {
 }
 /* [/RUNCACHE_DROP_WHEN_INLINED: handler-filter-guard] */
 
+/* [RUNCACHE_DROP_WHEN_INLINED: runcache-redis-keys-require] */
+// Standalone runs load the shared key mapping from the plugin. The
+// generator inlines the file body instead, so this require disappears.
+if (is_readable(__DIR__ . '/runcache-redis-keys.php')) {
+    require_once __DIR__ . '/runcache-redis-keys.php';
+}
+if (!function_exists('runcache_redis_page_key_head')) {
+    return;
+}
+/* [/RUNCACHE_DROP_WHEN_INLINED: runcache-redis-keys-require] */
+
 if (!runcache_should_cache()) {
     // Do not cache this request.
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0, private');
@@ -38,26 +49,29 @@ if (!runcache_should_cache()) {
 // Read the config global from the config section.
 $runcache_config = $GLOBALS['runcache_config'] ?? [];
 
-header('X-RunCache-Type: Redis');
-
 // ===== REDIS CONNECTION =====
 
 $runcache_redis = null;
 $runcache_key = null;
 
-// Use the same defaults as the object-cache drop-in when the
-// RUNCACHE_REDIS_* constants are missing from wp-config.php.
-$runcache_redis_host = defined('RUNCACHE_REDIS_HOST') && RUNCACHE_REDIS_HOST !== ''
+// Hand-written constants win, then the generated config channel, then
+// the same defaults as the object-cache drop-in.
+$runcache_redis_cfg = is_array($runcache_config['redis'] ?? null) ? $runcache_config['redis'] : [];
+$runcache_redis_host = defined('RUNCACHE_REDIS_HOST') && '' !== RUNCACHE_REDIS_HOST
     ? (string) RUNCACHE_REDIS_HOST
-    : '127.0.0.1';
-$runcache_redis_port = defined('RUNCACHE_REDIS_PORT') ? (int) RUNCACHE_REDIS_PORT : 6379;
+    : (string) ($runcache_redis_cfg['host'] ?? '127.0.0.1');
+$runcache_redis_port = defined('RUNCACHE_REDIS_PORT') ? (int) RUNCACHE_REDIS_PORT : (int) ($runcache_redis_cfg['port'] ?? 6379);
 
 if (class_exists('\Redis')) {
     try {
         $runcache_redis = new \Redis();
         if ($runcache_redis->connect($runcache_redis_host, $runcache_redis_port, 1.0)) {
-            $password = defined('RUNCACHE_REDIS_PASSWORD') ? (string) RUNCACHE_REDIS_PASSWORD : '';
-            $username = defined('RUNCACHE_REDIS_USERNAME') ? (string) RUNCACHE_REDIS_USERNAME : '';
+            $password = defined('RUNCACHE_REDIS_PASSWORD')
+                ? (string) RUNCACHE_REDIS_PASSWORD
+                : (string) ($runcache_redis_cfg['password'] ?? '');
+            $username = defined('RUNCACHE_REDIS_USERNAME')
+                ? (string) RUNCACHE_REDIS_USERNAME
+                : (string) ($runcache_redis_cfg['username'] ?? '');
 
             if ($password !== '' || $username !== '') {
                 $auth = $username !== '' ? [$username, $password] : [$password];
@@ -66,42 +80,43 @@ if (class_exists('\Redis')) {
 
             if (defined('RUNCACHE_REDIS_DATABASE')) {
                 $runcache_redis->select((int) RUNCACHE_REDIS_DATABASE);
+            } elseif (isset($runcache_redis_cfg['database'])) {
+                $runcache_redis->select((int) $runcache_redis_cfg['database']);
             }
 
             $runcache_redis->ping();
         } else {
             $runcache_redis = null;
+            error_log('[RunCache] Redis page cache connect failed: ' . $runcache_redis_host . ':' . $runcache_redis_port);
         }
     } catch (Throwable $e) {
         $runcache_redis = null;
+        error_log('[RunCache] Redis page cache connection error: ' . $e->getMessage());
     }
 }
+
+// Advertise Redis only after Redis answered a command. A failed
+// connection must not look like a healthy cacheable miss.
+if (!$runcache_redis instanceof \Redis) {
+    header('X-RunCache-Status: BYPASS');
+    return;
+}
+
+header('X-RunCache-Type: Redis');
 
 // ===== RESOLVE CACHE KEY =====
 
 // Build the key only when Redis is connected.
 if ($runcache_redis !== null) {
     // Sanitize the request data before the code builds the key.
-    $host = (string) (runcache_get_server_var('HTTP_HOST') ?: 'localhost');
-    $host = preg_replace('/[^a-zA-Z0-9.-]/', '-', $host) ?: 'localhost';
-    $host = trim($host, '.-');
-    $host = $host !== '' ? $host : 'localhost';
+    // The shared mapping owns the host and segment normalization.
+    $host = runcache_redis_page_sanitize_host((string) (runcache_get_server_var('HTTP_HOST') ?: 'localhost'));
 
     $uri = (string) (runcache_get_server_var('REQUEST_URI') ?: '/');
     $parsed_path = parse_url($uri, PHP_URL_PATH);
-    $path = is_string($parsed_path) ? str_replace('\\', '/', trim($parsed_path, '/')) : '';
+    $path = is_string($parsed_path) ? $parsed_path : '';
 
-    $safe_segments = [];
-    foreach (explode('/', $path) as $segment) {
-        if ($segment === '' || $segment === '.' || $segment === '..') {
-            continue;
-        }
-
-        $segment = preg_replace('/[^a-zA-Z0-9_-]/', '-', $segment);
-        if ($segment !== '') {
-            $safe_segments[] = $segment;
-        }
-    }
+    $safe_segments = runcache_redis_page_sanitize_segments($path);
 
     $parts = [$host];
     if ($safe_segments === []) {
@@ -137,11 +152,12 @@ if ($runcache_redis !== null) {
         }
     }
 
-    // Build the Redis key.
-    $prefix = defined('RUNCACHE_REDIS_KEY') ? rtrim((string) RUNCACHE_REDIS_KEY, ':') : 'runcache';
-    $site = strtolower(preg_replace('/:\d+$/', '', $host));
-    $site = preg_replace('/[^a-z0-9]/', '-', $site);
-    $runcache_key = $prefix . ':' . $site . ':' . implode('/', $parts);
+    // Build the Redis key. The key head comes from the shared mapping,
+    // so the drop-in and the admin-side purger share one key shape.
+    $prefix = defined('RUNCACHE_REDIS_KEY')
+        ? rtrim((string) RUNCACHE_REDIS_KEY, ':')
+        : rtrim((string) ($runcache_redis_cfg['key'] ?? 'runcache'), ':');
+    $runcache_key = runcache_redis_page_key_head($prefix, $host) . ':' . implode('/', $parts);
 }
 
 // ===== SERVE CACHE (HIT) =====

@@ -131,6 +131,10 @@ class ObjectCache
 
         do_action('runcache_object_cache_settings_saved', $settings);
 
+        // Every save stamps the per-site flag so the drop-in gate matches
+        // the stored option immediately, including a first-time disable.
+        $this->setting->write_config_file();
+
         return $result && $provider_result;
     }
 

@@ -286,9 +286,10 @@ class Cloudflare
                 return false;
             }
 
-            $ruleset_id = $this->get_cache_ruleset_id();
+            $ruleset_id = $this->get_or_create_cache_ruleset_id();
             if (is_wp_error($ruleset_id)) {
-                $this->logger->error('Failed to fetch rulesets', [
+                $this->logger->error('Failed to fetch or create ruleset', [
+                    'provider' => $this->get_provider_label(),
                     'error' => $ruleset_id->get_error_message(),
                 ]);
                 return false;
@@ -477,6 +478,63 @@ class Cloudflare
     }
 
     /**
+     * Return the http_request_cache_settings ruleset ID. Create the ruleset
+     * when the zone has no ruleset for this phase yet.
+     *
+     * @return string|WP_Error
+     */
+    private function get_or_create_cache_ruleset_id()
+    {
+        $ruleset_id = $this->get_cache_ruleset_id();
+
+        if (!is_wp_error($ruleset_id)) {
+            return $ruleset_id;
+        }
+
+        // Create only when the phase is absent. Do not mask API errors.
+        if ($ruleset_id->get_error_code() !== 'cache_settings_ruleset_not_found') {
+            return $ruleset_id;
+        }
+
+        return $this->create_cache_ruleset();
+    }
+
+    /**
+     * Create the http_request_cache_settings ruleset for the zone.
+     *
+     * @return string|WP_Error
+     */
+    private function create_cache_ruleset()
+    {
+        $url = $this->build_url(self::ENDPOINT_ZONES, [$this->zone_id, 'rulesets']);
+        $response = $this->make_request('POST', $url, [
+            'name' => 'RunCache',
+            'kind' => 'zone',
+            'phase' => 'http_request_cache_settings',
+            'rules' => [],
+        ]);
+
+        if (is_wp_error($response)) {
+            // A concurrent request may have created it. Re-read before failing.
+            $retry = $this->get_cache_ruleset_id();
+            return is_wp_error($retry) ? $response : $retry;
+        }
+
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        $ruleset_id = is_array($body) ? ($body['result']['id'] ?? '') : '';
+
+        if (!is_string($ruleset_id) || $ruleset_id === '') {
+            return $this->get_cache_ruleset_id();
+        }
+
+        $this->logger->info('Cache settings ruleset created', [
+            'provider' => $this->get_provider_label(),
+        ]);
+
+        return $ruleset_id;
+    }
+
+    /**
      * Get the rules for a given ruleset ID.
      *
      * @param string $ruleset_id
@@ -637,6 +695,53 @@ class Cloudflare
     }
 
     /**
+     * Fetch every zone the current credentials can access. Cloudflare returns
+     * 20 zones per page by default, so scoring one page misses later zones.
+     *
+     * @return array<int, array>|WP_Error
+     */
+    private function get_all_zones()
+    {
+        $zones = [];
+        $page = 1;
+        $total_pages = 1;
+
+        // Guard against a looping or malformed API response.
+        $max_pages = 200;
+
+        while ($page <= $total_pages && $page <= $max_pages) {
+            $url = $this->build_url(self::ENDPOINT_ZONES, [], [
+                'per_page' => 50,
+                'page' => $page,
+            ]);
+
+            $response = $this->make_request('GET', $url);
+            if (is_wp_error($response)) {
+                return $response;
+            }
+
+            $body = json_decode(wp_remote_retrieve_body($response), true);
+            if (!is_array($body) || empty($body['success'])) {
+                return new WP_Error('cloudflare_zones_failed', 'Unable to list Cloudflare zones');
+            }
+
+            $result = $body['result'] ?? [];
+            if (!is_array($result)) {
+                return new WP_Error('cloudflare_zones_failed', 'Unable to list Cloudflare zones');
+            }
+
+            $zones = array_merge($zones, $result);
+
+            $info = $body['result_info'] ?? [];
+            $reported = is_array($info) ? (int) ($info['total_pages'] ?? 1) : 1;
+            $total_pages = $reported > 0 ? $reported : 1;
+            $page++;
+        }
+
+        return $zones;
+    }
+
+    /**
      * Detect the best Cloudflare zone for this site using temporary credentials.
      *
      * @param string $api_token
@@ -665,14 +770,16 @@ class Cloudflare
         $this->auth_type = $auth_type;
         $this->account_email = $account_email;
 
-        $response = $this->make_request('GET', $this->build_url(self::ENDPOINT_ZONES));
+        try {
+            $zones = $this->get_all_zones();
+        } finally {
+            $this->api_token = $original_token;
+            $this->auth_type = $original_type;
+            $this->account_email = $original_email;
+        }
 
-        $this->api_token = $original_token;
-        $this->auth_type = $original_type;
-        $this->account_email = $original_email;
-
-        if (is_wp_error($response)) {
-            $error_message = $response->get_error_message();
+        if (is_wp_error($zones)) {
+            $error_message = $zones->get_error_message();
             $this->logger->error('Cloudflare zone detection failed', [
                 'provider' => $this->get_provider_label(),
                 'error' => $error_message,
@@ -684,9 +791,6 @@ class Cloudflare
 
             throw new Exception(esc_html__('Unable to detect the Cloudflare zone. Please check your credentials and try again.', 'runcache'));
         }
-
-        $body = json_decode(wp_remote_retrieve_body($response), true);
-        $zones = $body['result'] ?? [];
 
         $zone = $this->find_best_matching_zone($zones);
         if ($zone === null || !isset($zone['id'])) {
@@ -1251,14 +1355,19 @@ class Cloudflare
      *
      * @param string $endpoint
      * @param array $params
+     * @param array $query
      * @return string
      */
-    protected function build_url(string $endpoint, array $params = []): string
+    protected function build_url(string $endpoint, array $params = [], array $query = []): string
     {
         $url = self::API_BASE_URL . $endpoint;
 
         if (!empty($params)) {
             $url .= '/' . implode('/', array_map('urlencode', $params));
+        }
+
+        if (!empty($query)) {
+            $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
         }
 
         return $url;

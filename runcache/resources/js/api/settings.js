@@ -71,6 +71,8 @@ export const settingsApi = {
          * @param {boolean} settings.preload_onn - Enable general preloading
          * @param {boolean} settings.preload_path_onn - Enable custom preload paths
          * @param {string} settings.preload_path_mch - Custom preload paths (one per line)
+         * @param {boolean} settings.preload_exclude_cpt_onn - Exclude custom post types from preload all
+         * @param {string} settings.preload_exclude_cpt_mch - Post type slugs to exclude (one per line)
          * @param {boolean} settings.preload_schedule_onn - Enable scheduled preloading
          * @param {number} settings.preload_schedule_int - Scheduled preload interval
          * @param {string} settings.preload_schedule_unt - Scheduled preload unit (60, 3600, 86400)

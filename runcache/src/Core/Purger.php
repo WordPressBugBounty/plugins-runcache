@@ -20,6 +20,7 @@ class Purger
     private Logger $logger;
     private Validator $validator;
     private Setting $setting;
+    private bool $third_party_purged = false;
     private array $default_settings = [
         'purge_permalink_onn' => true,
         'purge_theme_switch_onn' => true,
@@ -96,6 +97,44 @@ class Purger
         $this->register_post_hooks();
         $this->register_comment_hooks();
         $this->register_conditional_hooks();
+        $this->register_third_party_hooks();
+    }
+
+    /**
+     * Register purge triggers for third-party cache and asset plugins
+     *
+     * @return void
+     */
+    private function register_third_party_hooks(): void
+    {
+        if (defined('WP_ROCKET_VERSION')) {
+            // rocket_after_clean_domain needs 3.15.5+; the legacy hook repeats once per language.
+            add_action('rocket_after_clean_domain', [$this, 'purge_all_once']);
+            add_action('after_rocket_clean_domain', [$this, 'purge_all_once']);
+        }
+
+        if (defined('ELEMENTOR_VERSION')) {
+            add_action('elementor/core/files/clear_cache', [$this, 'purge_all_once']);
+        }
+    }
+
+    /**
+     * Purge all caches once per request when a third-party plugin purges
+     *
+     * @return void
+     */
+    public function purge_all_once(): void
+    {
+        if ($this->third_party_purged) {
+            return;
+        }
+        $this->third_party_purged = true;
+
+        $this->logger->info('Third-party cache purge detected', [
+            'trigger' => current_action(),
+        ]);
+
+        $this->purge_all();
     }
 
     /**
@@ -122,6 +161,7 @@ class Purger
     {
         add_action('admin_post_runcache_purge_by_url', [$this, 'handle_purge_by_url']);
         add_action('admin_post_runcache_purge_all', [$this, 'handle_purge_all']);
+        add_action('admin_post_runcache_purge_network', [$this, 'handle_purge_network']);
     }
 
     /**
@@ -234,11 +274,13 @@ class Purger
     }
 
     /**
-     * Purge all cache
+     * Purge all cache for the current site.
      *
-     * Walks the entire cache directory, deletes every cache entry, and returns
-     * success only when deletion is verified. This avoids the host/port mismatch
-     * that made earlier versions report success while deleting nothing.
+     * The scope is the site's own cache subtree: the host directory on a
+     * single site or a subdomain network, the site's path directory on a
+     * subdirectory network. The main site of a subdirectory network clears
+     * the host tree while keeping every registered child site's directory.
+     * Provider markers live at the cache root and are never touched.
      *
      * @return bool
      */
@@ -246,15 +288,30 @@ class Purger
     {
         $multisite = new Multisite();
         $site_info = $multisite->get_site_info();
-        $this->logger->info('Purging cache for current site', [
-            'site_type' => $site_info['type'],
-            'identifier' => $site_info['identifier']
-        ]);
 
         $cache = new PageCache();
         $cache_dir = $cache->get_cache_directory();
 
-        $cleared = $this->clear_cache_directory($cache_dir);
+        $scope = $this->resolve_site_purge_scope($cache_dir);
+        if ($scope === null) {
+            // Fail closed: an unresolvable scope must delete nothing and
+            // must not fire the purge listeners either.
+            $this->logger->error('Cache purge aborted: site scope could not be resolved', [
+                'site_type' => $site_info['type'],
+                'identifier' => $site_info['identifier'],
+            ]);
+
+            return false;
+        }
+
+        $this->logger->info('Purging cache for current site', [
+            'site_type' => $site_info['type'],
+            'identifier' => $site_info['identifier'],
+            'scope' => $scope['scope'],
+            'directory' => $scope['directory'],
+        ]);
+
+        $cleared = $this->clear_site_scope($scope);
 
         $cache->ensure_cache_directory();
 
@@ -262,6 +319,7 @@ class Purger
 
         if (!$cleared['success']) {
             $this->logger->error('Cache purge completed with errors', [
+                'scope' => $scope['scope'],
                 'deleted_files' => $cleared['deleted_files'],
                 'deleted_dirs' => $cleared['deleted_dirs'],
                 'errors' => $cleared['errors'],
@@ -270,11 +328,179 @@ class Purger
         }
 
         $this->logger->info('Cache purged successfully', [
+            'scope' => $scope['scope'],
             'deleted_files' => $cleared['deleted_files'],
             'deleted_dirs' => $cleared['deleted_dirs'],
         ]);
 
         return true;
+    }
+
+    /**
+     * Resolves the directory scope of the current site's purge.
+     *
+     * @param string $cache_dir Cache root directory.
+     * @return array{scope:string, directory:string, mode:string, skip:array<int,string>}|null Null when the scope cannot be resolved.
+     */
+    private function resolve_site_purge_scope(string $cache_dir): ?array
+    {
+        $host = $this->get_cache_host();
+        if ($host === '') {
+            return null;
+        }
+
+        $host_dir = rtrim($cache_dir, '/\\') . '/' . $host;
+
+        if (!Multisite::is_multisite() || is_subdomain_install()) {
+            return [
+                'scope' => 'site',
+                'directory' => $host_dir,
+                'mode' => 'site',
+                'skip' => [],
+            ];
+        }
+
+        $blog_path = '';
+        if (function_exists('get_blog_details') && function_exists('get_current_blog_id')) {
+            $blog_details = get_blog_details(get_current_blog_id());
+            if ($blog_details instanceof \WP_Site) {
+                $blog_path = trim((string) $blog_details->path, '/');
+            }
+        }
+
+        if ($blog_path !== '') {
+            $safe_segments = Multisite::sanitize_cache_path_segments($blog_path);
+            if ($safe_segments === []) {
+                return null;
+            }
+
+            return [
+                'scope' => 'site',
+                'directory' => $host_dir . '/' . implode('/', $safe_segments),
+                'mode' => 'site',
+                'skip' => [],
+            ];
+        }
+
+        // Main site of a subdirectory network: clear the host tree, but
+        // keep every registered child site's directory. A site list that
+        // cannot be read aborts the purge instead of guessing.
+        $skip = $this->get_child_site_top_dirs();
+        if ($skip === null) {
+            return null;
+        }
+
+        return [
+            'scope' => 'host (excluding child sites)',
+            'directory' => $host_dir,
+            'mode' => 'host-tree',
+            'skip' => $skip,
+        ];
+    }
+
+    /**
+     * Clears the resolved site scope from the cache directory.
+     *
+     * @param array{scope:string, directory:string, mode:string, skip:array<int,string>} $scope Scope from resolve_site_purge_scope().
+     * @return array{deleted_files:int, deleted_dirs:int, errors:array<int,string>, success:bool}
+     */
+    private function clear_site_scope(array $scope): array
+    {
+        $result = [
+            'deleted_files' => 0,
+            'deleted_dirs' => 0,
+            'errors' => [],
+            'success' => true,
+        ];
+
+        $directory = $scope['directory'];
+
+        if (!is_dir($directory)) {
+            return $result;
+        }
+
+        if ($scope['mode'] !== 'host-tree') {
+            // A site subtree holds only cache entries, so top-level files
+            // go too. Markers live at the cache root, not here.
+            return $this->clear_cache_directory($directory, true);
+        }
+
+        $file = new File();
+        $entries = $file->dirlist($directory, false, true);
+        if (!is_array($entries)) {
+            $result['errors'][] = "Failed to list directory: {$directory}";
+            $result['success'] = false;
+            return $result;
+        }
+
+        foreach ($entries as $name => $info) {
+            if (!is_array($info)) {
+                continue;
+            }
+
+            $path = rtrim($directory, '/\\') . '/' . (string) $name;
+
+            if (($info['type'] ?? '') === 'd') {
+                if (in_array((string) $name, $scope['skip'], true)) {
+                    continue;
+                }
+
+                if ($file->delete($path, true)) {
+                    $result['deleted_dirs']++;
+                } else {
+                    $result['errors'][] = "Failed to remove directory: {$path}";
+                    $result['success'] = false;
+                }
+
+                continue;
+            }
+
+            if ($file->delete($path)) {
+                $result['deleted_files']++;
+            } else {
+                $result['errors'][] = "Failed to delete file: {$path}";
+                $result['success'] = false;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * First path segments of the network's child sites, in cache path form.
+     *
+     * @return array<int, string>|null Null when the site list cannot be read.
+     */
+    private function get_child_site_top_dirs(): ?array
+    {
+        if (!function_exists('get_sites')) {
+            return null;
+        }
+
+        $sites = get_sites(['number' => 9999]);
+        if (!is_array($sites)) {
+            return null;
+        }
+
+        $dirs = [];
+        foreach ($sites as $site) {
+            if (!$site instanceof \WP_Site) {
+                continue;
+            }
+
+            $path = trim((string) $site->path, '/');
+            if ($path === '') {
+                continue;
+            }
+
+            $segments = Multisite::sanitize_cache_path_segments($path);
+            $first = $segments[0] ?? '';
+            if ($first !== '') {
+                $dirs[$first] = true;
+            }
+        }
+
+        return array_keys($dirs);
     }
 
     /**
@@ -294,7 +520,9 @@ class Purger
         $cache = new PageCache();
         $cache_dir = $cache->get_cache_directory();
 
-        $cleared = $this->clear_cache_directory($cache_dir, true);
+        // Top-level files are provider markers; a network purge must keep
+        // them or every provider silently stops working.
+        $cleared = $this->clear_cache_directory($cache_dir, false);
 
         $cache->ensure_cache_directory();
 
@@ -351,8 +579,7 @@ class Purger
             foreach ($iterator as $item) {
                 $path = $item->getPathname();
 
-                // Preserve top-level files (e.g. .enabled-* markers, index.html)
-                // unless this is an explicit full-directory wipe.
+                // Sentinels and markers must survive a purge, else the provider stops working.
                 if (!$remove_top_level_files && $iterator->getDepth() === 0 && $item->isFile()) {
                     continue;
                 }
@@ -393,8 +620,9 @@ class Purger
         $scan_dir = $cache_dir;
 
         if (Multisite::is_multisite()) {
-            $scan_dir .= trim($this->get_cache_host(), '/\\') . DIRECTORY_SEPARATOR;
-            $this->logger->info('Purging expired cache files for current site');
+            // The walk deletes only expired entries, so it can cover
+            // every host bucket; alias hosts must not escape expiry.
+            $this->logger->info('Purging expired cache files network-wide');
         } else {
             $this->logger->info('Purging expired cache files (single site)');
         }
@@ -407,7 +635,6 @@ class Purger
         $purged = 0;
         $file = new File();
         $now = time();
-        $sentinel_path = wp_normalize_path($cache_dir . 'index.html');
 
         try {
             $iterator = new \RecursiveIteratorIterator(
@@ -416,11 +643,6 @@ class Purger
 
             foreach ($iterator as $file_info) {
                 if (!$file_info->isFile() || !str_ends_with($file_info->getFilename(), '.html')) {
-                    continue;
-                }
-
-                // Never treat the cache-root index.html sentinel as an orphaned entry.
-                if (wp_normalize_path($file_info->getPathname()) === $sentinel_path) {
                     continue;
                 }
 
@@ -742,7 +964,11 @@ class Purger
     }
 
     /**
-     * Check if a URL is the site homepage.
+     * Check if a URL is the current site's homepage.
+     *
+     * A child site's homepage carries the blog path, e.g.
+     * 'example.com/shop/' on a subdirectory network, so the URL path is
+     * compared to the site's home path, not to the empty string.
      *
      * @param string $url
      * @return bool
@@ -754,8 +980,10 @@ class Purger
             return false;
         }
 
-        $path = trim($parsed['path'] ?? '/', '/');
-        return $path === '';
+        $home_path = trim((string) wp_parse_url(home_url('/'), PHP_URL_PATH), '/');
+        $url_path = trim((string) ($parsed['path'] ?? ''), '/');
+
+        return $url_path === $home_path;
     }
 
     /**
@@ -811,6 +1039,45 @@ class Purger
         }
 
         return $cache_path;
+    }
+
+    /**
+     * Handle network purge requests (admin bar, network admins only)
+     *
+     * @return void
+     */
+    public function handle_purge_network(): void
+    {
+        if (!current_user_can('manage_network')) {
+            wp_die(esc_html__('You do not have sufficient permissions to perform this action.', 'runcache'));
+        }
+
+        check_admin_referer('runcache_purge_network');
+
+        try {
+            $this->purge_network();
+
+            add_settings_error(
+                'runcache',
+                'runcache_purged',
+                esc_html__('Network cache purged successfully.', 'runcache'),
+                'success'
+            );
+        } catch (\Exception $e) {
+            add_settings_error(
+                'runcache',
+                'runcache_purge_failed',
+                sprintf(
+                    /* translators: %s: error message */
+                    __('Failed to purge network cache: %s', 'runcache'),
+                    $e->getMessage()
+                ),
+                'error'
+            );
+        }
+
+        wp_safe_redirect(wp_get_referer() ?: network_admin_url());
+        exit;
     }
 
     /**
@@ -979,6 +1246,19 @@ class Purger
 
         if (empty($url)) {
             wp_send_json_error(['message' => 'Please provide a valid URL to purge']);
+        }
+
+        // An actor may only flush caches for sites they manage.
+        if (!$this->validator->url_in_actor_scope($url)) {
+            $this->logger->warning('Purge rejected: URL outside the actor site scope', [
+                'component' => 'Purger',
+                'url' => $url,
+                'user_id' => get_current_user_id(),
+            ]);
+
+            wp_send_json_error([
+                'message' => __('You can only purge or preload URLs on sites you manage.', 'runcache'),
+            ]);
         }
 
         try {
@@ -1569,6 +1849,24 @@ class Purger
                 'runcache',
                 'runcache_purge_failed',
                 esc_html__('Invalid URL provided for purging.', 'runcache'),
+                'error'
+            );
+            wp_safe_redirect(wp_get_referer() ?: home_url());
+            exit;
+        }
+
+        // An actor may only flush caches for sites they manage.
+        if (!$this->validator->url_in_actor_scope($sanitized_url)) {
+            $this->logger->warning('Purge rejected: URL outside the actor site scope', [
+                'component' => 'Purger',
+                'url' => $sanitized_url,
+                'user_id' => get_current_user_id(),
+            ]);
+
+            add_settings_error(
+                'runcache',
+                'runcache_purge_failed',
+                esc_html__('You can only purge URLs on sites you manage.', 'runcache'),
                 'error'
             );
             wp_safe_redirect(wp_get_referer() ?: home_url());

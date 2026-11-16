@@ -101,6 +101,34 @@
                                 preload all cache.
                             </p>
                         </div>
+
+                        <!-- Exclude Custom Post Types -->
+                        <div class="rce-flex rce-items-center rce-space-x-3">
+                            <Switch
+                                id="preload_exclude_cpt_onn"
+                                v-model="settings.preload_exclude_cpt_onn" />
+                            <Label
+                                for="preload_exclude_cpt_onn"
+                                class="rce-text-sm rce-text-gray-700">
+                                Exclude custom post type
+                            </Label>
+                        </div>
+
+                        <div
+                            v-show="settings.preload_exclude_cpt_onn"
+                            class="rce-ml-12 rce-space-y-3">
+                            <Textarea
+                                id="preload_exclude_cpt_mch"
+                                v-model="settings.preload_exclude_cpt_mch"
+                                auto-resize
+                                :min-height="80"
+                                :max-height="150"
+                                placeholder="product" />
+                            <p class="rce-text-sm rce-text-gray-500">
+                                One post type slug per line, these post types will be excluded
+                                when running preload all cache.
+                            </p>
+                        </div>
                     </div>
                 </CardContent>
             </Card>
@@ -308,6 +336,8 @@ const defaultSettings = {
     preload_onn: false,
     preload_path_onn: false,
     preload_path_mch: '',
+    preload_exclude_cpt_onn: false,
+    preload_exclude_cpt_mch: '',
     preload_schedule_onn: false,
     preload_schedule_int: 1,
     preload_schedule_unt: '86400',

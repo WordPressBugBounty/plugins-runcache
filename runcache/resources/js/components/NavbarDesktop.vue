@@ -5,7 +5,7 @@
             <div class="rce-flex rce-justify-between rce-items-center">
                 <AppLogo />
 
-                <div class="rce-flex rce-items-center rce-space-x-2">
+                <div class="rce-flex rce-items-center rce-gap-2">
                     <Button
                         variant="primary"
                         size="sm"
@@ -18,6 +18,14 @@
                             class="rce-animate-spin" />
                         {{ isPreloading ? preloadMessage || 'Preloading...' : 'Preload cache' }}
                     </Button>
+                    <button
+                        v-if="isPreloading"
+                        type="button"
+                        :disabled="isStoppingPreload"
+                        @click="$emit('stop-preload')"
+                        class="rce-mr-4 rce-text-sm rce-font-medium rce-text-primary-700 hover:rce-text-primary-600 rce-underline-offset-4 hover:rce-underline disabled:rce-opacity-60 disabled:rce-cursor-not-allowed rce-transition-colors">
+                        Stop preload
+                    </button>
                     <Button
                         size="sm"
                         variant="outline"
@@ -88,11 +96,15 @@ defineProps({
         type: Boolean,
         default: false,
     },
+    isStoppingPreload: {
+        type: Boolean,
+        default: false,
+    },
     preloadMessage: {
         type: String,
         default: '',
     },
 })
 
-defineEmits(['preload', 'purge'])
+defineEmits(['preload', 'purge', 'stop-preload'])
 </script>

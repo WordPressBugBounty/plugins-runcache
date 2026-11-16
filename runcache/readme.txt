@@ -4,7 +4,7 @@ Tags: cache, page cache, performance, redis, cloudflare
 Requires at least: 5.9
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 1.1.0
+Stable tag: 1.3.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -184,15 +184,27 @@ RunCache contacts two third-party services, and only when you enable that integr
 == Screenshots ==
 
 1. RunCache dashboard: cache status, pages cached, size
-2. Full Page Cache: RunCache detects your server and offers only the cache types that work
-3. NGINX Page Cache setup with the generated include line
+2. Full Page Cache: PHP, NGINX, FastCGI, Apache, LS Cache, Redis, Cloudflare
+3. NGINX FastCGI Cache setup with generated includes
 4. Redis Object Cache connection settings
-5. Asset CDN: BunnyCDN or your own CDN hostname
+5. Asset CDN: BunnyCDN, Custom CDN, Cloudflare APO
 6. Cache Rules: URL, cookie, query string, user agent, IP
 7. Cache Purger: triggers and manual tools
 8. Cache Preloader: rate limit and schedule
 
 == Changelog ==
+
+= 1.3.1 =
+* Fixed: per-site cache settings, purges, and preloads on multisite networks, including nested sites.
+* Fixed: Redis purges delete the keys the drop-in wrote, so content is never served stale.
+* Fixed: "Purge All" is per site, with an explicit "Purge network" action for network admins.
+* Fixed: the built-in WooCommerce no-cache rules match cart, checkout, and my-account at every layer, including child-site paths.
+* Fixed: the hourly expired-page cleanup covers every site and alias domain on a network.
+* Fixed: NGINX/Apache exclusion rules protect the admin pages of every site on the network.
+
+= 1.3.0 =
+* Fixed: object cache keys now include the site identity. Two WordPress sites that share one Redis server can no longer read each other's cached data.
+* The plugin removes the old unshared cache keys once during the update. WordPress rebuilds them from the database. This is a cache, no data is lost.
 
 = 1.0.0 =
 * First release on WordPress.org.
@@ -206,6 +218,12 @@ RunCache contacts two third-party services, and only when you enable that integr
 * Import and export settings as JSON.
 
 == Upgrade Notice ==
+
+= 1.3.1 =
+Multisite networks now get per-site cache behavior and server rules that cover every site. Re-save each site's cache settings once after updating so the server config files pick up the new exclusion rules.
+
+= 1.3.0 =
+Object cache keys now include the site identity. On the first request after the update, the object cache is cold and rebuilds from the database. Sites that share one Redis server stop sharing cache entries.
 
 = 1.0.0 =
 First release on WordPress.org.

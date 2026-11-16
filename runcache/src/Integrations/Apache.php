@@ -6,6 +6,7 @@ use RunCache\Core\PageCache;
 use RunCache\Core\Setting;
 use RunCache\Integrations\Interfaces\CacheProvider;
 use RunCache\Integrations\Traits\FilesystemCacheStats;
+use RunCache\Support\Environment;
 use RunCache\Support\File;
 use RunCache\Support\Logger;
 
@@ -147,7 +148,9 @@ class Apache implements CacheProvider
 
         $file = new File();
         $source = RUNCACHE_PLUGIN_DIR . '/includes/runcache-page-apache.conf';
-        $htaccess = ABSPATH . '.htaccess';
+        // The web server reads only the .htaccess the profile derives, so
+        // ABSPATH cannot be the anchor.
+        $htaccess = Environment::instance()->get_htaccess_path();
 
         if (!$file->exists($source)) {
             $this->logger->error('Source config file not found', ['provider' => 'Apache', 'source' => $source]);
@@ -160,6 +163,9 @@ class Apache implements CacheProvider
             $this->logger->error('Failed to read config file', ['provider' => 'Apache', 'source' => $source]);
             return false;
         }
+
+        // Layout tokens can carry path metacharacters, so the profile escapes them.
+        $apache_config = Environment::instance()->substitute($apache_config);
 
         $htaccess_content = '';
 
@@ -199,7 +205,7 @@ class Apache implements CacheProvider
         }
 
         $file = new File();
-        $htaccess = ABSPATH . '.htaccess';
+        $htaccess = Environment::instance()->get_htaccess_path();
 
         if (!$file->exists($htaccess)) {
             return true;

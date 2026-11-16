@@ -98,11 +98,11 @@ trait FilesystemCacheStats
      * Recursively collect cache .html files from a directory.
      *
      * @param string $directory
-     * @param File $file
-     * @param bool $is_root True on the initial call from the cache root scan.
+     * @param File   $file
+     * @param string $parent_dir_name
      * @return array
      */
-    private function get_cache_files(string $directory, File $file, bool $is_root = true): array
+    private function get_cache_files(string $directory, File $file, string $parent_dir_name = ''): array
     {
         $cache_files = [];
 
@@ -118,17 +118,15 @@ trait FilesystemCacheStats
 
             $type = $file_info['type'] ?? '';
 
-            if ($type === 'f') {
-                // Skip the root index.html sentinel; cache entries always live under site subdirectories.
-                if ($is_root && $filename === 'index.html') {
-                    continue;
-                }
+            // Real cached pages also use the name index.html, so the skip
+            // applies only at the sentinel locations.
+            $is_sentinel = 'index.html' === $filename
+                && ('' === $parent_dir_name || 'fastcgi' === $parent_dir_name);
 
-                if (pathinfo($filename, PATHINFO_EXTENSION) === 'html') {
-                    $cache_files[] = wp_normalize_path($directory . '/' . $filename);
-                }
+            if ('f' === $type && !$is_sentinel && pathinfo($filename, PATHINFO_EXTENSION) === 'html') {
+                $cache_files[] = wp_normalize_path($directory . '/' . $filename);
             } elseif ($type === 'd') {
-                $subdir_files = $this->get_cache_files($directory . '/' . $filename, $file, false);
+                $subdir_files = $this->get_cache_files($directory . '/' . $filename, $file, $filename);
                 $cache_files = array_merge($cache_files, $subdir_files);
             }
         }

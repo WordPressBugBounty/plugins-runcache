@@ -148,13 +148,13 @@ const configurationDefinitions = {
     cloudflare: {
         component: InstructionsForCloudflare,
         isAvailable: () =>
-            (enabled.value && activeType.value === 'cloudflare' && !edgeVerified.value) ||
+            (enabled.value && activeType.value === 'cloudflare') ||
             failedEnableProvider.value === 'cloudflare',
     },
     'cloudflare-apo': {
         component: InstructionsForCloudflareApo,
         isAvailable: () =>
-            (enabled.value && activeType.value === 'cloudflare-apo' && !edgeVerified.value) ||
+            (enabled.value && activeType.value === 'cloudflare-apo') ||
             failedEnableProvider.value === 'cloudflare-apo',
     },
 }

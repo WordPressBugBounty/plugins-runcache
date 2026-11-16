@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
  * Handles Redis cache integration with WordPress including:
  * - Cache configuration and settings management
  * - Connection verification and setup
- * - wp-config.php constants management
+ * - Generated-config channel for drop-in connection settings
  * - Cache purging (full and selective)
  * - AJAX endpoints for admin interface
  */
@@ -93,6 +93,7 @@ class Redis implements CacheProvider
             add_action('runcache_after_purge_all', [$this, 'purge_all_cache']);
             add_action('runcache_after_purge_post', [$this, 'purge_post_cache'], 10, 2);
             add_action('runcache_after_purge_url', [$this, 'purge_url_cache']);
+            add_action('runcache_after_purge_network', [$this, 'purge_network_page_cache']);
         }
     }
 
@@ -134,8 +135,8 @@ class Redis implements CacheProvider
     /**
      * Get RUNCACHE constant config
      *
-     * Password and username are optional. update_wp_config() skips them
-     * when the Redis server needs no password, so they default to ''.
+     * Password and username are optional. Hand-written constants are
+     * the documented override input and always win over stored settings.
      *
      * @return array
      */
@@ -157,22 +158,21 @@ class Redis implements CacheProvider
     /**
      * Get Redis settings
      *
+     * Hand-written RUNCACHE_REDIS_* constants stay the documented
+     * override input, so they win over every other source.
+     *
      * @return array
      */
     public function get_settings(): array
     {
-        $cache = new PageCache($this->logger);
-        $cache_settings = $cache->get_settings();
-
-        // Only accept a saved record with a usable host.
-        // An empty record must not block the wp-config constants fallback.
-        if (isset($cache_settings['provider']['redis']) && !empty($cache_settings['provider']['redis']['host'])) {
-            return $cache_settings['provider']['redis'];
-        }
-
         $runcache_config = $this->get_constant_config();
         if (!empty($runcache_config)) {
             return $runcache_config;
+        }
+
+        $stored = $this->get_stored_settings();
+        if (!empty($stored)) {
+            return $stored;
         }
 
         $rcwp_config = $this->get_rcwp_settings();
@@ -185,18 +185,71 @@ class Redis implements CacheProvider
     }
 
     /**
+     * Get the configured Redis connection for the generated config
+     * channel, without defaults and without any write side effect.
+     *
+     * Drop-ins read this channel before WordPress boots, so empty
+     * values keep their built-in defaults.
+     *
+     * @return array
+     */
+    public function get_connection_config(): array
+    {
+        $constants = $this->get_constant_config();
+        if (!empty($constants)) {
+            return $constants;
+        }
+
+        $stored = $this->get_stored_settings();
+        if (!empty($stored)) {
+            return $stored;
+        }
+
+        return $this->get_rcwp_settings();
+    }
+
+    /**
+     * Read the stored provider connection from the page-cache and
+     * object-cache settings without writing anything.
+     *
+     * @return array
+     */
+    private function get_stored_settings(): array
+    {
+        $cache = new PageCache($this->logger);
+        $cache_settings = $cache->get_settings();
+
+        if (isset($cache_settings['provider']['redis']) && !empty($cache_settings['provider']['redis']['host'])) {
+            return $cache_settings['provider']['redis'];
+        }
+
+        $object_settings = (new ObjectCache($this->logger))->get_settings();
+        if (isset($object_settings['provider']['redis']) && !empty($object_settings['provider']['redis']['host'])) {
+            return $object_settings['provider']['redis'];
+        }
+
+        return [];
+    }
+
+    /**
      * Save Redis settings
+     *
+     * Drop-ins read the generated config channel before WordPress
+     * boots, so wp-config.php is never written.
      *
      * @param array $settings
      * @return bool
      */
     protected function save_settings(array $settings): bool
     {
+        // The payload is admin-submitted JSON, so only known fields persist.
+        $settings = array_intersect_key(
+            $settings,
+            array_flip(['host', 'port', 'username', 'password', 'key', 'database'])
+        );
         $settings = wp_parse_args($settings, $this->get_default_settings());
 
-        if (empty($settings['key'])) {
-            $settings['key'] = 'runcache:';
-        }
+        $settings['key'] = $this->normalize_key_prefix((string) ($settings['key'] ?? ''));
 
         if (empty($settings['host'])) {
             $this->logger->error('Invalid settings', ['provider' => 'Redis', 'error' => 'host is required']);
@@ -208,7 +261,7 @@ class Redis implements CacheProvider
             return false;
         }
 
-        $this->update_wp_config($settings);
+        $dropin_installed = true;
 
         $pagecache = new PageCache($this->logger);
         $cache_settings = $pagecache->get_settings();
@@ -224,150 +277,50 @@ class Redis implements CacheProvider
             $objectcache->save_settings($cache_settings);
 
             $dropin = new Dropin();
-            return $dropin->install_object_cache_dropin();
+            $dropin_installed = $dropin->install_object_cache_dropin();
         }
 
         $this->connection = null;
         $this->key_prefix = null;
 
-        return true;
+        // The object-cache path fires no config-rewrite hook, so both
+        // drop-ins need the rebuild here.
+        $this->setting->write_config_file();
+
+        return $dropin_installed;
     }
 
     /**
-     * Update wp-config.php with Redis constants
+     * Normalize a key prefix to the plugin's key charset.
      *
-     * @param array $settings
-     * @return bool
+     * @param string $key Raw prefix from settings or a payload.
+     * @return string Prefix with one trailing colon, or the default when empty.
      */
-    protected function update_wp_config(array $settings): bool
+    private function normalize_key_prefix(string $key): string
     {
-        $this->logger->info('Start writing wp-config constants', ['provider' => 'Redis']);
-        $file = new File();
+        $key = trim($key);
+        $key = (string) preg_replace('/[^A-Za-z0-9._:-]/', '', $key);
+        $key = substr($key, 0, 100);
+        $key = rtrim($key, ':');
 
-        $config_path = $file->locate_wp_config();
-        if ($config_path === false) {
-            throw new Exception('wp-config.php not found');
+        if ($key === '') {
+            return 'runcache:';
         }
 
-        $config = $file->read($config_path);
-        if ($config === false) {
-            throw new Exception('Failed to read wp-config.php');
-        }
-
-        $config = $this->remove_redis_constants_from_content($config);
-
-        if (!empty($settings)) {
-            $constants = "\n/* RunCache Redis Configuration START */\n";
-            $constants .= "define('RUNCACHE_REDIS_HOST', '" . addslashes($settings['host']) . "');\n";
-            $constants .= "define('RUNCACHE_REDIS_PORT', '" . addslashes($settings['port']) . "');\n";
-
-            if (!empty($settings['key'])) {
-                $constants .= "define('RUNCACHE_REDIS_KEY', '" . addslashes($settings['key']) . "');\n";
-            }
-
-            if (!empty($settings['username'])) {
-                $constants .= "define('RUNCACHE_REDIS_USERNAME', '" . addslashes($settings['username']) . "');\n";
-            }
-
-            if (!empty($settings['password'])) {
-                $constants .= "define('RUNCACHE_REDIS_PASSWORD', '" . addslashes($settings['password']) . "');\n";
-            }
-
-            $constants .= "\n/* RunCache Redis Configuration END */\n";
-
-            $config = preg_replace_callback(
-                '/(\$table_prefix\s*=\s*[^\r\n]+[;\r\n]+)/',
-                static fn(array $matches): string => $matches[1] . $constants,
-                $config,
-                1
-            );
-
-            $this->logger->info('Generated wp-config constants block', [
-                'provider' => 'Redis',
-                'has_host' => !empty($settings['host']),
-                'has_port' => !empty($settings['port']),
-                'has_password' => !empty($settings['password']),
-                'has_username' => !empty($settings['username']),
-            ]);
-        }
-
-        $write_success = $file->write($config_path, $config);
-        if ($write_success === false) {
-            throw new Exception('Failed to write wp-config.php');
-        }
-
-        $this->logger->info('Finish writing wp-config constants', ['provider' => 'Redis']);
-        return true;
-    }
-
-    /**
-     * Strip RUNCACHE_REDIS_* constants from wp-config.php.
-     *
-     * @return bool True on success (or constants already absent), false on failure
-     */
-    public function cleanup_wp_config(): bool
-    {
-        try {
-            $this->update_wp_config([]);
-            $this->logger->info('Stripped wp-config constants', ['provider' => 'Redis']);
-            return true;
-        } catch (\Throwable $e) {
-            $this->logger->error('Failed to clean up wp-config constants', [
-                'provider' => 'Redis',
-                'error' => $e->getMessage(),
-            ]);
-            return false;
-        }
-    }
-
-    /**
-     * Remove Redis constants from config content
-     *
-     * @param string $config
-     * @return string
-     */
-    protected function remove_redis_constants_from_content(string $config): string
-    {
-$this->logger->info('Remove constants from config content', ['provider' => 'Redis']);
-
-        // Remove everything between START and END markers (including the markers themselves)
-        $config = preg_replace(
-            '/\n?\/\* RunCache Redis Configuration START \*\/.*\/\* RunCache Redis Configuration END \*\/\n?/s',
-            '',
-            $config
-        );
-
-        return $config;
+        return $key . ':';
     }
 
     /**
      * Enable Redis cache
      *
-     * Writes the RUNCACHE_REDIS_* constants to wp-config.php before the
-     * drop-in is installed, mirroring RedisObjectCache::enable(). The
-     * page-cache drop-in reads these constants at request time, before
-     * WordPress loads any other configuration.
+     * The drop-in reads connection settings from the generated config
+     * channel at request time, before WordPress loads any other
+     * configuration. wp-config.php is never written.
      *
      * @return bool
      */
     public function enable(): bool
     {
-        $settings = $this->get_settings();
-
-        if (!empty($settings['host'])) {
-            try {
-                $this->update_wp_config($settings);
-            } catch (\Throwable $e) {
-                // Do not block the drop-in install here: the drop-in falls
-                // back to 127.0.0.1:6379 when the constants are missing, so
-                // caching can still work when wp-config.php is not writable.
-                $this->logger->error('Failed to write Redis page cache constants to wp-config.php', [
-                    'provider' => 'Redis',
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
-
         $result = $this->install_dropin();
 
         if ($result) {
@@ -384,10 +337,6 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
      */
     public function disable(): bool
     {
-        if (!$this->is_other_cache_using_redis()) {
-            $this->update_wp_config([]);
-        }
-
         $this->connection = null;
         $this->key_prefix = null;
 
@@ -413,8 +362,20 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
             return false;
         }
 
+        // Gate 1: prove the Redis round-trip first. The drop-in's
+        // advertised header proves nothing about connectivity.
         try {
-            $this->test_connection($settings);
+            if (!$this->test_connection($settings)) {
+                $this->logger->error('Redis connection verification failed', [
+                    'provider' => 'Redis',
+                    'host' => $settings['host'] ?? '',
+                    'port' => $settings['port'] ?? '',
+                ]);
+                return [
+                    'message' => 'Redis connection failed. Check the host, port, username, and password.',
+                    'verified' => false
+                ];
+            }
         } catch (Exception $e) {
             $this->logger->error('Redis connection verification failed', ['error' => $e->getMessage()]);
             return [
@@ -423,6 +384,7 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
             ];
         }
 
+        // Gate 2: only after connectivity is proven, confirm the drop-in serves.
         $cache = new PageCache($this->logger);
         $response = $cache->request_cache_type();
 
@@ -514,9 +476,12 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
             $host = strtolower((string) wp_parse_url(get_site_url(), PHP_URL_HOST));
         }
 
+        // Purge keys must match the keys the drop-in writes, so the
+        // precedence mirrors the drop-in resolution.
+        $connection = $this->get_connection_config();
         $prefix = defined('RUNCACHE_REDIS_KEY')
             ? rtrim((string) RUNCACHE_REDIS_KEY, ':')
-            : 'runcache';
+            : rtrim((string) ($connection['key'] ?? 'runcache'), ':');
 
         $site = strtolower(preg_replace('/:\d+$/', '', $host));
         $site = preg_replace('/[^a-z0-9]/', '-', $site);
@@ -591,10 +556,16 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
     /**
      * Get Redis key prefix
      *
+     * @param string|null $base_key Optional override, e.g. the prefix submitted for a save.
      * @return string
      */
-    protected function get_key_prefix(): string
+    protected function get_key_prefix(?string $base_key = null): string
     {
+        // A submitted prefix must be proven as-is, so it bypasses the cache.
+        if ($base_key !== null && $base_key !== '') {
+            return $base_key;
+        }
+
         if ($this->key_prefix !== null) {
             return $this->key_prefix;
         }
@@ -606,48 +577,190 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
     }
 
     /**
-     * Get site identifier for key scoping
+     * Load the shared Redis key mapping used by the page-cache drop-in.
      *
-     * @return string
+     * @return bool True when the mapping functions are available.
      */
-    private function get_site_identifier(): string
+    private function require_redis_key_mapping(): bool
     {
-        $site_url = get_site_url();
-        $host = strtolower((string) wp_parse_url($site_url, PHP_URL_HOST));
-        $path = trim((string) wp_parse_url($site_url, PHP_URL_PATH), '/');
-
-        if ($host === '') {
-            $host = 'localhost';
+        if (function_exists('runcache_redis_page_url_patterns')) {
+            return true;
         }
 
-        $identifier = $host;
-
-        if ($path !== '') {
-            $identifier .= ':' . str_replace('/', '-', $path);
+        $mapping_file = RUNCACHE_PLUGIN_DIR . 'includes/runcache-redis-keys.php';
+        if (is_readable($mapping_file)) {
+            require_once $mapping_file;
         }
 
-        $identifier = preg_replace('/[^a-z0-9:\-]/i', '-', $identifier);
-        $identifier = preg_replace('/-+/', '-', $identifier);
-        $identifier = trim($identifier, '-:');
+        return function_exists('runcache_redis_page_url_patterns');
+    }
 
-        return $identifier;
+    /**
+     * Canonical host of the current site, as the drop-in stores it.
+     *
+     * @return string Host without port, never empty.
+     */
+    private function get_purge_host(): string
+    {
+        $host = wp_parse_url(home_url('/'), PHP_URL_HOST);
+        $host = is_string($host) ? strtolower($host) : '';
+
+        return $host !== '' ? $host : 'localhost';
+    }
+
+    /**
+     * Registered path of the current site on a subdirectory network.
+     *
+     * @return string Path without slashes at the ends, '' otherwise.
+     */
+    private function get_page_cache_site_path(): string
+    {
+        if (!Multisite::is_multisite() || is_subdomain_install()) {
+            return '';
+        }
+
+        if (!function_exists('get_blog_details') || !function_exists('get_current_blog_id')) {
+            return '';
+        }
+
+        $blog_details = get_blog_details(get_current_blog_id());
+        if (!$blog_details instanceof \WP_Site) {
+            return '';
+        }
+
+        return trim((string) $blog_details->path, '/');
+    }
+
+    /**
+     * Registered paths of the network's child sites.
+     *
+     * The main site of a subdirectory network keeps these out of its own
+     * purge scope.
+     *
+     * @return array<int, string> Child site paths without slashes at the ends.
+     */
+    private function get_child_site_paths(): array
+    {
+        if (!Multisite::is_multisite() || is_subdomain_install() || !function_exists('get_sites')) {
+            return [];
+        }
+
+        $paths = [];
+        $sites = get_sites(['number' => 9999]);
+        foreach ($sites as $site) {
+            if (!$site instanceof \WP_Site) {
+                continue;
+            }
+
+            $path = trim((string) $site->path, '/');
+            if ($path === '') {
+                continue;
+            }
+
+            $paths[] = $path;
+        }
+
+        return $paths;
     }
 
     /**
      * Get scoped key prefix for current site
      *
+     * Mirrors the drop-in key family, so the connection test writes into
+     * the namespace the drop-in actually reads. The drop-in repeats the
+     * host as the first key path segment.
+     *
+     * @param string|null $base_key Optional base-prefix override.
      * @return string
      */
-    protected function get_scoped_key_prefix(): string
+    protected function get_scoped_key_prefix(?string $base_key = null): string
     {
-        $base = rtrim($this->get_key_prefix(), ':');
-        $identifier = $this->get_site_identifier();
-
-        if ($identifier !== '') {
-            return $base . ':' . $identifier . ':';
+        if (!$this->require_redis_key_mapping()) {
+            return rtrim($this->get_key_prefix($base_key), ':') . ':';
         }
 
-        return $base . ':';
+        $host = runcache_redis_page_sanitize_host($this->get_purge_host());
+        $head = runcache_redis_page_key_head($this->get_key_prefix($base_key), $host);
+        $root = $head . ':' . $host;
+
+        $site_path = $this->get_page_cache_site_path();
+        if ($site_path === '') {
+            return $root . ':';
+        }
+
+        $safe_segments = runcache_redis_page_sanitize_segments($site_path);
+        if ($safe_segments === []) {
+            return $root . ':';
+        }
+
+        return $root . '/' . implode('/', $safe_segments) . ':';
+    }
+
+    /**
+     * Scans Redis with the given patterns and deletes the matching keys.
+     *
+     * SCAN keeps the load bounded and DEL runs in batches. An optional
+     * filter drops keys outside the purge scope before deletion.
+     *
+     * @param \Redis             $redis    Redis connection.
+     * @param array<int, string> $patterns Glob patterns to scan.
+     * @param callable|null      $filter   Optional fn(string $key): bool scope filter.
+     * @return int Number of deleted keys.
+     */
+    private function scan_and_delete(\Redis $redis, array $patterns, ?callable $filter = null): int
+    {
+        $deleted = 0;
+
+        foreach ($patterns as $pattern) {
+            $iterator = null;
+
+            do {
+                $result = $redis->scan($iterator, $pattern, 500);
+                $keys = $this->normalize_scan_result($iterator, $result);
+
+                if ($filter !== null && $keys !== []) {
+                    $keys = array_values(array_filter($keys, $filter));
+                }
+
+                if ($keys === []) {
+                    continue;
+                }
+
+                foreach (array_chunk($keys, 500) as $batch) {
+                    $redis->del($batch);
+                    $deleted += count($batch);
+                }
+            } while ($iterator !== 0);
+        }
+
+        return $deleted;
+    }
+
+    /**
+     * Deletes one URL's page-cache entries in the drop-in's key shape.
+     *
+     * @param string $url URL to purge.
+     * @return int Number of deleted keys, or -1 when the URL is unusable.
+     */
+    private function purge_url_keys(string $url): int
+    {
+        if (!$this->require_redis_key_mapping()) {
+            $this->logger->error('Shared Redis key mapping is missing', ['provider' => 'Redis']);
+            return -1;
+        }
+
+        $parsed_url = wp_parse_url($url);
+        if ($parsed_url === false || empty($parsed_url['host'])) {
+            return -1;
+        }
+
+        $redis = $this->get_connection();
+        $host = (string) $parsed_url['host'];
+        $path = isset($parsed_url['path']) ? (string) $parsed_url['path'] : '';
+
+        $patterns = runcache_redis_page_url_patterns($this->get_key_prefix(), $host, $path);
+
+        return $this->scan_and_delete($redis, $patterns);
     }
 
     /**
@@ -661,7 +774,9 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
         try {
             $redis = $this->create_connection($settings);
 
-            $key_prefix = $this->get_scoped_key_prefix();
+            // Prove the prefix the save will store, not the stored one.
+            $submitted_key = isset($settings['key']) ? (string) $settings['key'] : '';
+            $key_prefix = $this->get_scoped_key_prefix($submitted_key !== '' ? $submitted_key : null);
 
             $test_key = $key_prefix . 'test_' . uniqid('', true);
             $test_value = 'test_' . time();
@@ -679,6 +794,10 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
 
             return true;
         } catch (Exception $e) {
+            $this->logger->error('Redis connection test failed', [
+                'provider' => 'Redis',
+                'error' => $e->getMessage(),
+            ]);
             return false;
         }
     }
@@ -693,7 +812,27 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
         $validator = new Validator();
         $validator->validate_ajax_request();
 
-        wp_send_json_success($this->get_settings());
+        $settings = $this->get_settings();
+        $settings['key_locked'] = self::key_prefix_is_constant_locked();
+
+        wp_send_json_success($settings);
+    }
+
+    /**
+     * Whether a wp-config constant owns the key prefix.
+     *
+     * Constants win over stored settings, so the form input must not
+     * suggest an editable value when one is defined.
+     *
+     * @return bool
+     */
+    private static function key_prefix_is_constant_locked(): bool
+    {
+        if (defined('RUNCACHE_REDIS_KEY')) {
+            return true;
+        }
+
+        return defined('RCWP_REDIS_PASSWORD') && defined('RCWP_REDIS_DOMAIN');
     }
 
     /**
@@ -707,6 +846,15 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
         $validator->validate_ajax_request();
 
         $settings = $validator->validate_ajax_settings();
+
+        // Prove the exact value the save will store, so normalize first.
+        $settings['key'] = $this->normalize_key_prefix((string) ($settings['key'] ?? ''));
+
+        // A constant owns the prefix, so the saved value mirrors the chain
+        // and the constants-versus-saved comparison stays exact.
+        if (self::key_prefix_is_constant_locked()) {
+            $settings['key'] = $this->normalize_key_prefix((string) ($this->get_settings()['key'] ?? ''));
+        }
 
         if (!$this->test_connection($settings)) {
             wp_send_json_error([
@@ -880,58 +1028,36 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
             return;
         }
 
-        try {
-            $redis = $this->get_connection();
-            $key_prefix = $this->get_scoped_key_prefix();
+        foreach ($urls as $url) {
+            try {
+                $deleted = $this->purge_url_keys($url);
 
-            foreach ($urls as $url) {
-                try {
-                    $parsed_url = wp_parse_url($url);
-                    if ($parsed_url === false) {
-                        throw new Exception('Failed to parse URL: ' . sanitize_text_field($url));
-                    }
-
-                    $host = $parsed_url['host'] ?? '';
-                    $path = isset($parsed_url['path']) ? rtrim($parsed_url['path'], '/') : '';
-                    $key_pattern = $key_prefix . $host . $path . '*';
-
-                    $keys = $redis->keys($key_pattern);
-                    if (!empty($keys)) {
-                        $redis->del($keys);
-                        $this->logger->info('Cache purged for post', [
-                            'provider' => 'Redis',
-                            'post_id' => $post_id,
-                            'url' => $url,
-                            'keys_count' => count($keys)
-                        ]);
-                    } else {
-                        $this->logger->info('No cache found for post', [
-                            'provider' => 'Redis',
-                            'post_id' => $post_id,
-                            'url' => $url
-                        ]);
-                    }
-                } catch (Exception $e) {
-                    $this->logger->error('Failed to purge cache for post', [
-                        'provider' => 'Redis',
-                        'post_id' => $post_id,
-                        'url' => $url,
-                        'error' => $e->getMessage()
-                    ]);
+                if ($deleted < 0) {
+                    throw new Exception('Failed to parse URL: ' . sanitize_text_field($url));
                 }
+
+                $this->logger->info($deleted > 0 ? 'Cache purged for post' : 'No cache found for post', [
+                    'provider' => 'Redis',
+                    'post_id' => $post_id,
+                    'url' => $url,
+                    'keys_count' => $deleted,
+                ]);
+            } catch (Exception $e) {
+                $this->logger->error('Failed to purge cache for post', [
+                    'provider' => 'Redis',
+                    'post_id' => $post_id,
+                    'url' => $url,
+                    'error' => $e->getMessage()
+                ]);
             }
-        } catch (Exception $e) {
-            $this->logger->error('Failed to purge cache for post', [
-                'provider' => 'Redis',
-                'post_id' => $post_id,
-                'urls' => $urls,
-                'error' => $e->getMessage()
-            ]);
         }
     }
 
     /**
      * Purge cache by URL
+     *
+     * Deletes the URL's entry and its q_/e_ variant keys. The patterns
+     * come from the shared key mapping, so the shapes match the drop-in.
      *
      * @param string $url
      * @return void
@@ -944,30 +1070,18 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
         }
 
         try {
-            $redis = $this->get_connection();
-            $key_prefix = $this->get_scoped_key_prefix();
+            $deleted = $this->purge_url_keys($url);
 
-            $parsed_url = wp_parse_url($url);
-            if ($parsed_url === false) {
+            if ($deleted < 0) {
                 $this->logger->error('Failed to parse URL for purge', ['provider' => 'Redis', 'url' => $url]);
                 return;
             }
 
-            $host = $parsed_url['host'] ?? '';
-            $path = isset($parsed_url['path']) ? rtrim($parsed_url['path'], '/') : '';
-            $key_pattern = $key_prefix . $host . $path . '*';
-
-            $keys = $redis->keys($key_pattern);
-            if (!empty($keys)) {
-                $redis->del($keys);
-                $this->logger->info('Cache purged for URL', [
-                    'provider' => 'Redis',
-                    'url' => $url,
-                    'keys_count' => count($keys)
-                ]);
-            } else {
-                $this->logger->info('No cache found for URL', ['provider' => 'Redis', 'url' => $url]);
-            }
+            $this->logger->info($deleted > 0 ? 'Cache purged for URL' : 'No cache found for URL', [
+                'provider' => 'Redis',
+                'url' => $url,
+                'keys_count' => $deleted
+            ]);
         } catch (Exception $e) {
             $this->logger->error('Failed to purge cache for URL', [
                 'provider' => 'Redis',
@@ -1056,25 +1170,83 @@ $this->logger->info('Remove constants from config content', ['provider' => 'Redi
     }
 
     /**
-     * Purge all Redis cache
+     * Purge all Redis page-cache entries for the current site.
+     *
+     * On the main site of a subdirectory network the child sites' entries
+     * stay, so the scan result is filtered against the site list.
      *
      * @return void
      */
     public function purge_all_cache(): void
     {
         try {
-            $redis = $this->get_connection();
-            $key_prefix = $this->get_scoped_key_prefix();
-
-            $keys = $redis->keys($key_prefix . '*');
-            if (!empty($keys)) {
-                $redis->del($keys);
-                $this->logger->info('Cache purged successfully', ['provider' => 'Redis', 'keys_count' => count($keys)]);
-            } else {
-                $this->logger->info('No cache found to purge', ['provider' => 'Redis']);
+            if (!$this->require_redis_key_mapping()) {
+                $this->logger->error('Shared Redis key mapping is missing', ['provider' => 'Redis']);
+                return;
             }
+
+            $redis = $this->get_connection();
+            $base_prefix = $this->get_key_prefix();
+            $host = $this->get_purge_host();
+            $site_path = $this->get_page_cache_site_path();
+
+            $patterns = runcache_redis_page_site_patterns($base_prefix, $host, $site_path);
+
+            $filter = null;
+            $child_paths = [];
+            if ($site_path === '' && Multisite::is_multisite() && !is_subdomain_install()) {
+                $child_paths = $this->get_child_site_paths();
+                $filter = static fn (string $key): bool => runcache_redis_page_key_in_site_scope(
+                    $key,
+                    $base_prefix,
+                    $host,
+                    $site_path,
+                    $child_paths
+                );
+            }
+
+            $deleted = $this->scan_and_delete($redis, $patterns, $filter);
+
+            $this->logger->info('Cache purged successfully', [
+                'provider' => 'Redis',
+                'scope' => $site_path === '' ? 'host' : 'site',
+                'site_path' => $site_path,
+                'excluded_child_sites' => count($child_paths),
+                'keys_count' => $deleted,
+            ]);
         } catch (Exception $e) {
             $this->logger->error('Failed to purge cache', ['provider' => 'Redis', 'error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Purge every Redis page-cache entry of the whole install.
+     *
+     * The network purge only; the pattern also covers the object-cache
+     * namespace, which the network purge clears anyway.
+     *
+     * @return void
+     */
+    public function purge_network_page_cache(): void
+    {
+        try {
+            if (!$this->require_redis_key_mapping()) {
+                $this->logger->error('Shared Redis key mapping is missing', ['provider' => 'Redis']);
+                return;
+            }
+
+            $redis = $this->get_connection();
+            $pattern = runcache_redis_page_network_pattern($this->get_key_prefix());
+
+            $deleted = $this->scan_and_delete($redis, [$pattern]);
+
+            $this->logger->info('Network cache purged', [
+                'provider' => 'Redis',
+                'scope' => 'network',
+                'keys_count' => $deleted,
+            ]);
+        } catch (Exception $e) {
+            $this->logger->error('Failed to purge network cache', ['provider' => 'Redis', 'error' => $e->getMessage()]);
         }
     }
 }

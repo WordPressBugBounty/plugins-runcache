@@ -14,7 +14,21 @@ async function ajaxRequest(action, params = {}) {
     }
 
     const nonce = window.runcacheAjax?.nonce || ''
-    const ajaxUrl = window.runcacheAjax?.ajaxurl || '/wp-admin/admin-ajax.php'
+    let ajaxUrl = window.runcacheAjax?.ajaxurl || '/wp-admin/admin-ajax.php'
+
+    // The browser blocks http fetches from an https page (mixed content).
+    // Same-host http AJAX URLs use https for the fetch.
+    if (window.location.protocol === 'https:' && ajaxUrl.startsWith('http://')) {
+        try {
+            const parsed = new URL(ajaxUrl)
+            if (parsed.host === window.location.host) {
+                parsed.protocol = 'https:'
+                ajaxUrl = parsed.href
+            }
+        } catch (urlError) {
+            console.error('Invalid AJAX URL:', urlError)
+        }
+    }
 
     try {
         const body = new URLSearchParams({

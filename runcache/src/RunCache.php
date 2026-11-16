@@ -61,6 +61,7 @@ class RunCache
                 Core\Rules::class,
                 Core\Setting::class,
                 Core\SettingsTransfer::class,
+                Core\SiteLifecycle::class,
                 Core\Cdn::class,
                  Core\Edge::class,
                  Core\ObjectCache::class,
@@ -101,6 +102,8 @@ class RunCache
 
         add_action('admin_bar_menu', [$this, 'add_admin_bar_menu'], 100);
         add_action('upgrader_process_complete', [Dropin::class, 'refresh_on_update'], 10, 2);
+        add_action('runcache_rules_updated', [Dropin::class, 'refresh_page_cache_dropin'], 20);
+        add_action('runcache_purger_updated', [Dropin::class, 'refresh_page_cache_dropin'], 20);
 
         // Admin-post handlers
         add_action('admin_post_runcache_preload_all', [$this, 'handle_preload_all']);
@@ -342,7 +345,19 @@ class RunCache
                 'title' => __('Purge All', 'runcache'),
                 'href' => wp_nonce_url(admin_url('admin-post.php?action=runcache_purge_all'), 'runcache_purge_all'),
                 'meta' => [
-                    'title' => __('Purge entire cache', 'runcache')
+                    'title' => __('Purge this site\'s cache', 'runcache')
+                ]
+            ]);
+        }
+
+        if ($cache_enabled && is_multisite() && current_user_can('manage_network')) {
+            $wp_admin_bar->add_node([
+                'id' => 'runcache-purge-network',
+                'parent' => 'runcache',
+                'title' => __('Purge Network', 'runcache'),
+                'href' => wp_nonce_url(admin_url('admin-post.php?action=runcache_purge_network'), 'runcache_purge_network'),
+                'meta' => [
+                    'title' => __('Purge the cache of every site on the network', 'runcache')
                 ]
             ]);
         }
@@ -575,8 +590,8 @@ class RunCache
         $dropin = new Dropin();
         $dropin->remove_page_cache_dropin();
 
-        // Remove object cache drop-in and strip RUNCACHE_REDIS_* from wp-config.php
-        // (constants are only stripped if no other cache is still using Redis
+        // Hand-written RUNCACHE_REDIS_* constants must survive deactivation
+        // because they are user-owned input.
         try {
             (new \RunCache\Integrations\RedisObjectCache())->disable();
         } catch (\Throwable $e) {
@@ -602,14 +617,9 @@ class RunCache
 
         $logger = new \RunCache\Support\Logger();
 
-        // 1. strip RUNCACHE_REDIS_* constants from wp-config.php.
-        try {
-            (new \RunCache\Integrations\Redis($logger))->cleanup_wp_config();
-        } catch (\Throwable $e) {
-            $logger->error('uninstall: wp-config.php cleanup failed', [
-                'error' => $e->getMessage(),
-            ]);
-        }
+        // 1. Hand-written RUNCACHE_REDIS_* constants are user-owned input
+        // and stay inert defines once no drop-in loads them.
+        $logger->info('uninstall: wp-config constants left in place by design');
 
         // 2. Disable the active cache provider (removes Cloudflare rules / APO toggle).
         // We cannot rely on the runcache_cache_providers filter here because the
@@ -669,14 +679,12 @@ class RunCache
             ]);
         }
 
-        // 5. Delete the shared config file and its lock file. Normal operation
-        // never unlinks the lock file. Uninstall is the only deletion point.
+        // 5. The config file and its lock live outside the cache directory,
+        // so the wipe above cannot remove them.
         try {
             $file = new File();
-            $lock_file = $file->lock_path_for(RUNCACHE_CONFIG_FILE);
-
             $file->delete(RUNCACHE_CONFIG_FILE);
-            $file->delete($lock_file);
+            $file->delete($file->lock_path_for(RUNCACHE_CONFIG_FILE));
         } catch (\Throwable $e) {
             $logger->error('uninstall: config file deletion failed', [
                 'error' => $e->getMessage(),

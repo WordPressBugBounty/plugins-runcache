@@ -7,8 +7,10 @@
             :cached-pages="cachedPages"
             :is-preloading="isPreloading"
             :is-purging="isPurging"
+            :is-stopping-preload="isStoppingPreload"
             :preload-message="preloadMessage"
             @preload="preloadCache"
+            @stop-preload="stopPreload"
             @purge="purgeCache" />
     </header>
 </template>
@@ -24,9 +26,11 @@ const {
     cachedPages,
     isPreloading,
     isPurging,
+    isStoppingPreload,
     preloadMessage,
     loadStats,
     preloadCache,
+    stopPreload,
     purgeCache,
     checkPreloadStatus,
     cleanup,

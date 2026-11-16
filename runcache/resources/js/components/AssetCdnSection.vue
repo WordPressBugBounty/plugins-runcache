@@ -145,11 +145,11 @@ const providers = computed(() => ({
 const configurationDefinitions = {
     bunnycdn: {
         component: InstructionsForBunnyCDN,
-        isAvailable: () => enabled.value && activeType.value === 'bunnycdn' && !cdnVerified.value,
+        isAvailable: () => enabled.value && activeType.value === 'bunnycdn',
     },
     custom: {
         component: InstructionsForCustomCDN,
-        isAvailable: () => enabled.value && activeType.value === 'custom' && !cdnVerified.value,
+        isAvailable: () => enabled.value && activeType.value === 'custom',
     },
 }
 

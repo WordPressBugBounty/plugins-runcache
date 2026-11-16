@@ -8,6 +8,7 @@ use RunCache\Core\Setting;
 use RunCache\Integrations\Interfaces\CacheProvider;
 use RunCache\Integrations\Traits\FilesystemCacheStats;
 use RunCache\Support\Dropin;
+use RunCache\Support\Environment;
 use RunCache\Support\File;
 use RunCache\Support\Logger;
 use RunCache\Support\Validator;
@@ -161,6 +162,12 @@ class Nginx implements CacheProvider
             $this->logger->error('Failed to read config file', ['provider' => 'Nginx', 'path' => $source]);
             return false;
         }
+
+        // Layout tokens can carry path metacharacters, so the profile escapes them.
+        // The marker block resolves the per-site suffix for subdirectory sites.
+        $nginx_config = Environment::instance()->substitute($nginx_config, [
+            '{{MARKER_SITE_IFS}}' => Multisite::nginx_marker_site_ifs(),
+        ]);
 
         $write_success = $file->write($target, $nginx_config);
 

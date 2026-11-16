@@ -72,51 +72,10 @@
                 </div>
             </li>
 
-            <!-- Deny Internal Cache Files in Server Block -->
-            <li class="rce-space-y-4">
-                <div class="rce-flex rce-items-center rce-space-x-3">
-                    <StepNumber :number="3" />
-                    <span class="rce-font-medium rce-text-sm">
-                        Deny Internal Cache Files in Server Block
-                    </span>
-                </div>
-                <div class="md:rce-ml-[4.75rem] rce-space-y-4">
-                    <p class="rce-text-sm rce-text-gray-600">
-                        RunCache stores internal state files under
-                        <code
-                            class="rce-bg-gray-200/50 rce-px-1 rce-py-0.5 rce-rounded rce-font-mono rce-text-xs">
-                            wp-content/cache/runcache/
-                        </code>
-                        and generated config files under
-                        <code
-                            class="rce-bg-gray-200/50 rce-px-1 rce-py-0.5 rce-rounded rce-font-mono rce-text-xs">
-                            wp-content/uploads/runcache/
-                        </code>
-                        . None of them are served over HTTP. Add this block to your NGINX
-                        <code
-                            class="rce-bg-gray-200/50 rce-px-1 rce-py-0.5 rce-rounded rce-font-mono rce-text-xs">
-                            server
-                        </code>
-                        block, next to the two includes:
-                    </p>
-
-                    <CodeSnippet
-                        :code="`# RunCache: internal cache state is never URL-served.
-location ~* /wp-content/cache/runcache/.*\\.(json|meta)$ {
-    deny all;
-    return 404;
-}
-location ~* /wp-content/uploads/runcache/.*\\.conf$ {
-    deny all;
-    return 404;
-}`" />
-                </div>
-            </li>
-
             <!-- Test and Reload -->
             <li class="rce-space-y-4">
                 <div class="rce-flex rce-items-center rce-space-x-3">
-                    <StepNumber :number="4" />
+                    <StepNumber :number="3" />
                     <span class="rce-font-medium rce-text-sm">Test and Reload NGINX</span>
                 </div>
                 <div class="md:rce-ml-[4.75rem] rce-space-y-4">

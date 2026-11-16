@@ -3,6 +3,7 @@ namespace RunCache\Core;
 
 use RunCache\Integrations\Interfaces\CacheProvider;
 use RunCache\Support\Dropin;
+use RunCache\Support\Environment;
 use RunCache\Support\File;
 use RunCache\Support\Logger;
 use RunCache\Support\Server;
@@ -101,13 +102,16 @@ class PageCache
     {
         $settings = wp_parse_args($this->setting->get('page_cache'), $this->default_settings);
 
-        // Add server information
-        // Read-only: serves the cached value or ''. Never detects or runs HTTP.
+        // Read-only: the server type comes from storage, so no HTTP probe runs here.
         $settings['server_type'] = (new Server())->get_server_type();
-        $settings['document_root'] = untrailingslashit(ABSPATH);
+        // ABSPATH is the core dir on Bedrock, so the root comes from the layout profile.
+        $environment = Environment::instance();
+        $settings['document_root'] = $environment->get_document_root();
 
         $config_dir = (new File())->get_config_dir();
-        $settings['config_dir'] = $config_dir !== false ? untrailingslashit($config_dir) : untrailingslashit(ABSPATH);
+        $settings['config_dir'] = $config_dir !== false ? untrailingslashit($config_dir) : $environment->get_document_root();
+
+        $settings['wp_cache'] = self::wp_cache_status();
 
         $settings['site_url'] = home_url();
         $settings['site_name'] = get_bloginfo('name');
@@ -282,10 +286,7 @@ class PageCache
     }
 
     /**
-     * Ensure cache directory exists with current protection files
-     *
-     * Protection files are rewritten when their content is missing or
-     * outdated, so existing installs pick up new deny rules automatically.
+     * Ensure cache directory exists
      *
      * @return bool
      */
@@ -295,58 +296,50 @@ class PageCache
 
         $file = new File();
 
-        if (!$file->exists($cache_dir) && !$file->mkdir($cache_dir)) {
-            $this->logger->error('Failed to create cache directory', [
-                'path' => $cache_dir
-            ]);
-            return false;
+        if (!$file->exists($cache_dir)) {
+            $created = $file->mkdir($cache_dir);
+
+            if (!$created) {
+                $this->logger->error('Failed to create cache directory', [
+                    'path' => $cache_dir
+                ]);
+                return false;
+            }
+
+            // The file may be served directly, so an empty body discloses nothing.
+            $file->write($cache_dir . 'index.html', '');
+
+            $htaccess_content = "Options -Indexes\n<FilesMatch \"\\.meta$\">\n    Require all denied\n</FilesMatch>\n";
+            $file->write($cache_dir . '.htaccess', $htaccess_content);
+
+            $web_config_content = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<configuration>\n    <system.webServer>\n        <security>\n            <requestFiltering>\n                <fileExtensions allowUnlisted=\"true\">\n                    <add fileExtension=\".meta\" allowed=\"false\" />\n                </fileExtensions>\n            </requestFiltering>\n        </security>\n    </system.webServer>\n</configuration>\n";
+            $file->write($cache_dir . 'web.config', $web_config_content);
         }
-
-        $index_content = '<!-- Silence is golden - RunCache protected directory -->';
-
-        $htaccess_content = "Options -Indexes\n<FilesMatch \"\\.(json|meta)$\">\n    Require all denied\n</FilesMatch>\n";
-
-        $web_config_content = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<configuration>\n    <system.webServer>\n        <security>\n            <requestFiltering>\n                <fileExtensions allowUnlisted=\"true\">\n                    <add fileExtension=\".meta\" allowed=\"false\" />\n                    <add fileExtension=\".json\" allowed=\"false\" />\n                </fileExtensions>\n            </requestFiltering>\n        </security>\n    </system.webServer>\n</configuration>\n";
-
-        $this->ensure_protection_file($file, $cache_dir . 'index.html', $index_content);
-        $this->ensure_protection_file($file, $cache_dir . '.htaccess', $htaccess_content);
-        $this->ensure_protection_file($file, $cache_dir . 'web.config', $web_config_content);
 
         return true;
     }
 
     /**
-     * Write a protection file only when its content is missing or outdated.
-     *
-     * @param File $file File helper.
-     * @param string $path Absolute file path.
-     * @param string $content Expected content.
-     * @return void
-     */
-    private function ensure_protection_file(File $file, string $path, string $content): void
-    {
-        if ($file->exists($path)) {
-            $current = $file->read($path);
-            if ($current === $content) {
-                return;
-            }
-        }
-
-        $file->write($path, $content);
-    }
-
-    /**
      * Enable WP_CACHE constant in wp-config.php
+     *
+     * Bedrock stubs and site config files are site-owned, so the plugin
+     * never writes them there; WP_CACHE stays a guided operator step.
      *
      * @return bool
      */
     public function enable_wp_cache(): bool
     {
+        $environment = Environment::instance();
+
+        if ($environment->is_bedrock()) {
+            return $this->verify_bedrock_wp_cache();
+        }
+
         $file = new File();
 
-        // Find wp-config.php
-        $wp_config_path = $file->locate_wp_config();
-        if ($wp_config_path === false) {
+        // Writes go only to the config file the layout marks writable.
+        $wp_config_path = $environment->get_writable_config_path();
+        if ($wp_config_path === null) {
             $this->logger->error('wp-config.php not found');
             return false;
         }
@@ -380,17 +373,132 @@ class PageCache
     }
 
     /**
+     * Check WP_CACHE on Bedrock without writing any config file.
+     *
+     * Constants are already loaded, so a read-only scan suffices and
+     * tailors the logged instruction.
+     *
+     * @return bool True when WP_CACHE is effectively enabled.
+     */
+    private function verify_bedrock_wp_cache(): bool
+    {
+        if (defined('WP_CACHE') && WP_CACHE) {
+            $this->logger->info('WP_CACHE is enabled by site configuration', ['layout' => 'bedrock']);
+            return true;
+        }
+
+        $defined_in = $this->find_bedrock_wp_cache_definition();
+        $this->logger->warning('WP_CACHE is not enabled; the page cache needs one operator step', [
+            'layout' => 'bedrock',
+            'wp_cache_defined_in' => '' !== $defined_in ? $defined_in : 'nowhere',
+            'instruction' => "Add Config::define('WP_CACHE', true); to config/application.php",
+        ]);
+
+        return false;
+    }
+
+    /**
+     * Find where the site config defines WP_CACHE (read-only).
+     *
+     * The scan stays read-only because .env and site config files are
+     * operator-owned.
+     *
+     * @return string Relative file path, or '' when not found.
+     */
+    private function find_bedrock_wp_cache_definition(): string
+    {
+        $config_dir = Environment::instance()->get_document_root() . '/config';
+        $candidates = [
+            $config_dir . '/application.php' => 'config/application.php',
+        ];
+
+        $env_files = glob($config_dir . '/environments/*.php');
+        if (is_array($env_files)) {
+            foreach ($env_files as $env_file) {
+                $candidates[$env_file] = 'config/environments/' . basename($env_file);
+            }
+        }
+
+        $file = new File();
+        foreach ($candidates as $path => $relative) {
+            $content = $file->read($path);
+            if (!is_string($content) || $content === '') {
+                continue;
+            }
+
+            $defines_wp_cache = preg_match(
+                '/(Config::define|define)\s*\(\s*[\'"]WP_CACHE[\'"]/',
+                $content
+            );
+
+            if ($defines_wp_cache === 1) {
+                return $relative;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Summarize the effective WP_CACHE state for the dashboard.
+     *
+     * The check is live, so one status covers a failed classic config
+     * write and the guided Bedrock operator step.
+     *
+     * @return array<string, mixed>
+     */
+    public static function wp_cache_status(): array
+    {
+        $environment = Environment::instance();
+        $active = defined('WP_CACHE') && WP_CACHE;
+
+        if ($environment->is_bedrock()) {
+            return [
+                'active' => $active,
+                // Site-owned config stays unwritten.
+                'writable' => null,
+                'layout' => Environment::LAYOUT_BEDROCK,
+                // Bedrock keeps config at the project root, above the docroot.
+                'config_path' => dirname($environment->get_document_root()) . '/config/application.php',
+                'line' => "Config::define('WP_CACHE', true);",
+            ];
+        }
+
+        $config_path = $environment->get_writable_config_path();
+
+        return [
+            'active' => $active,
+            'writable' => is_string($config_path) ? (new File())->is_writable($config_path) : null,
+            'layout' => Environment::LAYOUT_CLASSIC,
+            'config_path' => $config_path,
+            'line' => "define('WP_CACHE', true);",
+        ];
+    }
+
+    /**
      * Disable WP_CACHE constant in wp-config.php
+     *
+     * Site-owned defines are never removed; drop-in removal keeps
+     * deactivation reliable because a lingering define loads nothing.
      *
      * @return bool
      */
     public function disable_wp_cache(): bool
     {
+        $environment = Environment::instance();
+
+        if ($environment->is_bedrock()) {
+            $this->logger->info('WP_CACHE left to site configuration; drop-in removal ensures nothing loads', [
+                'layout' => 'bedrock',
+            ]);
+            return true;
+        }
+
         $file = new File();
 
-        // Find wp-config.php
-        $wp_config_path = $file->locate_wp_config();
-        if ($wp_config_path === false) {
+        // Writes go only to the config file the layout marks writable.
+        $wp_config_path = $environment->get_writable_config_path();
+        if ($wp_config_path === null) {
             $this->logger->error('wp-config.php not found');
             return false;
         }

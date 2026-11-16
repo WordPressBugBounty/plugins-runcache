@@ -3,9 +3,8 @@
 /**
  * RunCache WordPress plugin
  *
- * Loads the generated cache config (wp-content/runcache-config.php) for the
- * current site. One 'sites' map holds the keys for all single-site and
- * multisite installs.
+ * Loads one site's entry from the generated wp-content/runcache-config.php,
+ * whose 'sites' map holds every single-site and multisite key.
  *
  * @package RunCache
  * @since 0.0.8
@@ -243,60 +242,74 @@ if (!function_exists('runcache_normalize_config_host')) {
     }
 }
 
-if (!function_exists('runcache_get_config_key')) {
+if (!function_exists('runcache_get_config_candidates')) {
     /**
-     * Returns the config map key for the current site.
+     * Returns the config map keys to try for the current request, longest first.
      *
      * Must stay in sync with Multisite::get_config_key() in
-     * src/Integrations/Multisite.php. Both sides must produce identical keys.
+     * src/Integrations/Multisite.php and runcache_object_cache_config_candidates()
+     * in includes/object-cache.php, so all sides yield identical keys.
      *
-     * An empty or fully sanitized result (e.g. empty HTTP_HOST under CLI)
-     * misses the lookup. The per-site fallback then applies.
+     * The first candidate present in the sites map wins. A subpage of the
+     * main site then falls back to the host row, and a nested site matches
+     * its full path before its parent's row.
      *
-     * @return string Config key, e.g. 'example.com' or 'example.com/shop'.
+     * @return array<int, string> Candidate keys, longest path first.
      */
-    function runcache_get_config_key(): string
+    function runcache_get_config_candidates(): array
     {
         $host = runcache_normalize_config_host(runcache_get_server_var('HTTP_HOST'));
 
-        // Subdirectory multisite: the first URI path segment is the site.
-        $segment = '';
-        if (defined('MULTISITE') && MULTISITE && (!defined('SUBDOMAIN_INSTALL') || !SUBDOMAIN_INSTALL)) {
-            $uri = runcache_get_server_var('REQUEST_URI');
-            $path = parse_url($uri, PHP_URL_PATH);
-            $path = trim(is_string($path) ? $path : '', '/');
+        // An empty host (e.g. under CLI) misses the lookup on purpose, so
+        // the per-site fallback then applies.
+        if ($host === '') {
+            return [];
+        }
 
-            if ($path !== '') {
-                $parts = explode('/', $path);
-                $segment = runcache_normalize_config_component((string) array_shift($parts));
+        if (!(defined('MULTISITE') && MULTISITE && (!defined('SUBDOMAIN_INSTALL') || !SUBDOMAIN_INSTALL))) {
+            return [$host];
+        }
+
+        // Subdirectory multisite: the URI path narrows the site, most
+        // specific path first, and the host row is the last candidate.
+        $uri = runcache_get_server_var('REQUEST_URI');
+        $parsed_path = parse_url($uri, PHP_URL_PATH);
+        $path = trim(is_string($parsed_path) ? $parsed_path : '', '/');
+
+        $candidates = [];
+        $prefix = '';
+        foreach (explode('/', $path) as $segment) {
+            $segment = runcache_normalize_config_component($segment);
+            if ($segment === '') {
+                continue;
             }
+
+            $prefix = $prefix === '' ? $segment : $prefix . '/' . $segment;
+            $candidates[] = $host . '/' . $prefix;
         }
 
-        if ($segment === '') {
-            return $host;
-        }
+        $candidates = array_reverse($candidates);
+        $candidates[] = $host;
 
-        return $host . '/' . $segment;
+        return $candidates;
     }
 }
 
 // ===== LOAD CONFIGURATION =====
 
-$runcache_config_key = runcache_get_config_key();
 $runcache_loaded = null;
 
 if (is_readable(RUNCACHE_CONFIG_FILE)) {
     $runcache_ob_level = ob_get_level();
     ob_start();
     try {
-        // The config file must contain exactly one `return array(...)`.
-        // A broken file must not abort the request.
+        // A broken file must not abort the request, so the include is guarded.
         $runcache_loaded = @include RUNCACHE_CONFIG_FILE;
     } catch (\Throwable $runcache_exception) {
         $runcache_loaded = null; // ParseError is catchable (PHP 7+).
     } finally {
-        // Discard stray output a corrupted file may emit on include.
-        // Close only our own buffer, never an outer one.
+        // A corrupted file can emit stray output on include, and only
+        // our own buffer may be closed, never an outer one.
         if (ob_get_level() > $runcache_ob_level) {
             ob_end_clean();
         }
@@ -307,33 +320,56 @@ if (is_readable(RUNCACHE_CONFIG_FILE)) {
     }
 }
 
-$runcache_site_config = is_array($runcache_loaded)
-    ? ($runcache_loaded['sites'][$runcache_config_key] ?? null)
-    : null;
+$runcache_site_config = null;
+$runcache_matched_site_key = '';
+if (is_array($runcache_loaded)
+    && isset($runcache_loaded['sites'])
+    && is_array($runcache_loaded['sites'])
+) {
+    foreach (runcache_get_config_candidates() as $runcache_candidate) {
+        if (isset($runcache_loaded['sites'][$runcache_candidate])
+            && is_array($runcache_loaded['sites'][$runcache_candidate])
+        ) {
+            $runcache_site_config = $runcache_loaded['sites'][$runcache_candidate];
+            $runcache_matched_site_key = $runcache_candidate;
+            break;
+        }
+    }
+}
 
 if (is_array($runcache_site_config)) {
-    // Valid file, this site's key present.
     $GLOBALS['runcache_config'] = $runcache_site_config;
 } elseif (is_array($runcache_loaded)) {
-    // Valid file, key absent (fresh child site): fail-open defaults,
-    // same semantics as a missing per-site config file.
+    // A fresh child site keeps the fail-open semantics of a missing file.
     $GLOBALS['runcache_config'] = array_merge(
         ['cache_enabled' => true, 'page_cache_type' => 'php'],
         $runcache_fallback_rules
     );
 } elseif (is_readable(RUNCACHE_CONFIG_FILE)) {
-    // File exists but is broken (parse error, wrong type): FAIL CLOSED.
-    // A broken config must not cache anything with guessed rules.
+    // A broken config must not cache anything with guessed rules, so this fails closed.
     $GLOBALS['runcache_config'] = array_merge(
         ['cache_enabled' => false, 'page_cache_type' => 'php'],
         $runcache_fallback_rules
     );
 } else {
-    // File missing: fail-open defaults (first request before first save).
+    // The first request runs before the first save, so the defaults fail open.
     $GLOBALS['runcache_config'] = array_merge(
         ['cache_enabled' => true, 'page_cache_type' => 'php'],
         $runcache_fallback_rules
     );
+}
+
+// The WooCommerce floor is root-anchored, so a child site needs its own
+// path-relative copies. The matched key carries the site path.
+if (str_contains($runcache_matched_site_key, '/')
+    && is_array($GLOBALS['runcache_hardcoded_exclusions'] ?? null)
+    && is_array($GLOBALS['runcache_hardcoded_exclusions']['exclude_url'] ?? null)
+) {
+    $runcache_site_path = substr($runcache_matched_site_key, (int) strpos($runcache_matched_site_key, '/') + 1);
+    foreach (['cart', 'checkout', 'my-account'] as $runcache_woo_endpoint) {
+        $GLOBALS['runcache_hardcoded_exclusions']['exclude_url'][] =
+            '^/' . $runcache_site_path . '/' . $runcache_woo_endpoint . '(/|$)';
+    }
 }
 
 // Set HTTP_X_DEVICE from the User-Agent when the cache key uses it
